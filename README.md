@@ -18,6 +18,7 @@ DECKER+ is a dual-device data collection app for synchronized laptop keystrokes 
 
 ## Folder Structure
 
+```
 /
 ├── server.js
 ├── service-account-key.json (ignored)
@@ -45,6 +46,7 @@ DECKER+ is a dual-device data collection app for synchronized laptop keystrokes 
     │   └── TypingConsole.js
     └── python_scripts/
         └── sync_audio.py
+```
 
 ## How It Works
 
