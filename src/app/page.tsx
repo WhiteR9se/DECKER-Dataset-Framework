@@ -189,7 +189,7 @@ export default function Home() {
               Auto-filled from your browser and session handshake.
             </p>
             <div className="mt-4 grid gap-4 sm:grid-cols-3">
-              <label className="flex flex-col gap-1 text-xs font-medium uppercase tracking-wide text-slate-500">
+              <label className="flex flex-col gap-1 text-xs font-medium uppercase tracking-wide text-slate-500 sm:col-span-3">
                 Session ID
                 <input
                   readOnly

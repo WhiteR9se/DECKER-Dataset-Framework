@@ -10,16 +10,60 @@ const port = parseInt(process.env.PORT || "3000", 10);
 const app = next({ dev });
 const handle = app.getRequestHandler();
 
-let sessionCounter = 0;
-
-function nextSessionId() {
-  sessionCounter += 1;
-  return `DECKER_SESS_${String(sessionCounter).padStart(3, "0")}`;
-}
-
 app.prepare().then(() => {
   const uploadRoot = path.join(os.tmpdir(), "decker_sessions");
+  const counterFile = path.join(uploadRoot, "session_counter.json");
   const cleanupThresholdMs = 60 * 60 * 1000;
+
+  let sessionCounter = 0;
+  let counterReady = false;
+  let counterLock = Promise.resolve();
+
+  const loadCounter = async () => {
+    try {
+      await fs.mkdir(uploadRoot, { recursive: true });
+      const raw = await fs.readFile(counterFile, "utf8");
+      const data = JSON.parse(raw);
+      sessionCounter = Number(data?.lastId || 0);
+    } catch (error) {
+      sessionCounter = 0;
+      await fs.writeFile(
+        counterFile,
+        JSON.stringify({ lastId: sessionCounter }, null, 2)
+      );
+    }
+    counterReady = true;
+  };
+
+  const persistCounter = async () => {
+    await fs.writeFile(
+      counterFile,
+      JSON.stringify({ lastId: sessionCounter }, null, 2)
+    );
+  };
+
+  const nextSessionId = async () => {
+    counterLock = counterLock.then(async () => {
+      if (!counterReady) {
+        await loadCounter();
+      }
+      sessionCounter += 1;
+      await persistCounter();
+    });
+//DECKER_SESS_YYYYMMDD_HHMMSS_<counter>_<RAND> new format of session id. 
+    await counterLock;
+    const now = new Date();
+    const stamp = `${now.getFullYear()}${String(
+      now.getMonth() + 1
+    ).padStart(2, "0")}${String(now.getDate()).padStart(2, "0")}_${String(
+      now.getHours()
+    ).padStart(2, "0")}${String(now.getMinutes()).padStart(2, "0")}${String(
+      now.getSeconds()
+    ).padStart(2, "0")}`;
+    const counter = String(sessionCounter).padStart(4, "0");
+    const randomSuffix = Math.random().toString(36).slice(2, 6).toUpperCase();
+    return `DECKER_SESS_${stamp}_${counter}_${randomSuffix}`;
+  };
 
   const cleanupOldFiles = async () => {
     try {
@@ -75,8 +119,8 @@ app.prepare().then(() => {
   io.on("connection", (socket) => {
     console.log("Socket connected:", socket.id);
 
-    socket.on("request_session", () => {
-      const sessionId = nextSessionId();
+    socket.on("request_session", async () => {
+      const sessionId = await nextSessionId();
       const room = `room:${sessionId}`;
 
       socket.join(room);
