@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { io } from "socket.io-client";
+import type { Socket } from "socket.io-client";
 import QRCodeDisplay from "../components/QRCodeDisplay";
 import TerminalScripts from "../components/TerminalScripts";
 import TypingConsole from "../components/TypingConsole";
@@ -84,7 +85,7 @@ export default function Home() {
   const [hardwareInfo, setHardwareInfo] = useState(emptyHardwareInfo);
   const [participant, setParticipant] = useState(emptyParticipant);
   const [activeTab, setActiveTab] = useState("paragraph");
-  const [socket, setSocket] = useState(null);
+  const [socket, setSocket] = useState<Socket | null>(null);
   const [socketStatus, setSocketStatus] = useState("disconnected");
   const [socketError, setSocketError] = useState("");
 
