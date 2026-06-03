@@ -227,7 +227,9 @@ export default function MobileClient() {
 		);
 
 		try {
-			const response = await fetch("/api/upload", {
+			const apiBase =
+				process.env.NEXT_PUBLIC_SOCKET_URL || window.location.origin;
+			const response = await fetch(`${apiBase}/api/upload`, {
 				method: "POST",
 				body: formData,
 			});
