@@ -6,7 +6,7 @@ NIXPACKS_PYTHON_VERSION = "3.13"
 
 [phases.setup]
 # Explicitly listing all three so FFmpeg doesn't overwrite Node or Python
-nixPkgs = ["nodejs_20", "python3", "ffmpeg"]
+nixPkgs = ["nodejs_20", "ffmpeg"]
 
 [phases.build]
 cmds = ["npm install", "pip install -r requirements.txt"]
