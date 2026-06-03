@@ -128,7 +128,7 @@ export default function Home() {
       nextSocket.emit("request_session");
     };
 
-    const handleDisconnect = (reason) => {
+    const handleDisconnect = (reason: string) => {
       setSocketStatus("disconnected");
       setSocketError(reason ? `Disconnected: ${reason}` : "");
     };
