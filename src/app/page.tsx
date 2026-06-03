@@ -133,10 +133,15 @@ export default function Home() {
       setSocketError(reason ? `Disconnected: ${reason}` : "");
     };
 
-    const handleConnectError = (error) => {
+    const handleConnectError = (error: unknown) => {
       setSocketStatus("error");
+      const details =
+        typeof error === "object" && error && "description" in error
+          ? String(error.description)
+          : "";
       const detail =
-        error?.description || error?.message || "Socket connection failed";
+        details || (error instanceof Error ? error.message : "") ||
+        "Socket connection failed";
       setSocketError(detail);
     };
 
@@ -174,7 +179,10 @@ export default function Home() {
     [deviceId, deviceInfo, hardwareInfo, participant, sessionId]
   );
 
-  const handleParticipantChange = (field, value) => {
+  const handleParticipantChange = (
+    field: keyof typeof emptyParticipant,
+    value: string
+  ) => {
     setParticipant((prev) => ({
       ...prev,
       [field]: value,
