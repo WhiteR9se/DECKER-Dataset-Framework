@@ -17,7 +17,7 @@ Finally, we conclude with a mix: The year is 2025; version v1.0-beta includes fe
 
 const specialKeyText = `1) Tab  2) Backspace  3) Delete  4) Arrow Up  5) Arrow Down  6) Arrow Left  7) Arrow Right  8) Esc  9) F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12  10) Caps Lock (press once to enable, once to disable)  11) Enter (to confirm completion)`;
 
-function detectOS(userAgent, platform) {
+function detectOS(userAgent: string, platform: string) {
   const ua = userAgent.toLowerCase();
   const pf = platform.toLowerCase();
   if (ua.includes("windows") || pf.includes("win")) return "Windows";
@@ -26,7 +26,7 @@ function detectOS(userAgent, platform) {
   return "Unknown";
 }
 
-function detectBrowser(userAgent) {
+function detectBrowser(userAgent: string) {
   const ua = userAgent.toLowerCase();
   if (ua.includes("edg/")) return "Edge";
   if (ua.includes("brave")) return "Brave";
@@ -36,7 +36,7 @@ function detectBrowser(userAgent) {
   return "Unknown";
 }
 
-function sanitizeDevicePart(value) {
+function sanitizeDevicePart(value: string) {
   return String(value || "")
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
@@ -44,7 +44,7 @@ function sanitizeDevicePart(value) {
     .slice(0, 24) || "unknown";
 }
 
-function buildDeviceId(osName, browserName) {
+function buildDeviceId(osName: string, browserName: string) {
   const osPart = sanitizeDevicePart(osName);
   const browserPart = sanitizeDevicePart(browserName);
   const suffix = Math.random().toString(36).slice(2, 8);
