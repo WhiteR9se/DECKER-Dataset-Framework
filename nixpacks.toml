@@ -1,6 +1,14 @@
-[providers]
-node = "20"
-python = "3.11"
+providers = ["node", "python"]
+
+[variables]
+NIXPACKS_NODE_VERSION = "20"
+NIXPACKS_PYTHON_VERSION = "3.13"
 
 [phases.setup]
-aptPkgs = ["ffmpeg"]
+nixPkgs = ["ffmpeg"]
+
+[phases.build]
+cmds = ["npm install", "pip install -r requirements.txt"]
+
+[start]
+cmd = "node server.js"
