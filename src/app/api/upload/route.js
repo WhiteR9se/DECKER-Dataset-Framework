@@ -4,7 +4,10 @@ import os from "os";
 import { execFile } from "child_process";
 import {
 	ensureFolder,
+	downloadFileText,
+	findFileId,
 	getDriveClient,
+	upsertTextFile,
 	uploadFileFromPath,
 } from "../../../lib/googleDriveClient";
 
@@ -16,6 +19,33 @@ const manifestFile = "manifest.json";
 const processingLock = "processing.lock";
 const defaultDriveParentId = "1VlFQjn2t-H7_cihRnjmjNjMK3lGt-5xN";
 const pythonPath = process.env.PYTHON_PATH || "python3";
+const masterCsvName = "master_sessions.csv";
+
+const masterFields = [
+	"session_id",
+	"device_id",
+	"operating_system",
+	"browser_name",
+	"laptop_make",
+	"laptop_model",
+	"cpu_model",
+	"ram_gb",
+	"screen_resolution",
+	"battery_status",
+	"wifi_signal_strength",
+	"audio_device_name",
+	"audio_driver_version",
+	"keyboard_layout_locale",
+	"person_no",
+	"age_range",
+	"gender",
+	"dominant_hand",
+	"years_keyboard_use",
+	"profession_field",
+	"keyboard_type",
+	"room_type",
+	"voip_type",
+];
 
 const log = (...args) => {
 	console.log("[upload]", ...args);
@@ -41,7 +71,7 @@ const readManifest = async (sessionDir) => {
 		const data = await fsp.readFile(path.join(sessionDir, manifestFile), "utf8");
 		return JSON.parse(data);
 	} catch (error) {
-		return { sessionId: null };
+		return { sessionId: null, deviceId: null };
 	}
 };
 
@@ -57,6 +87,71 @@ const deriveExtension = (fileName) => {
 	return ext || ".webm";
 };
 
+const sanitizeDriveName = (value) => {
+	const safe = String(value || "")
+		.replace(/[\\/?%*:|"<>]/g, "-")
+		.replace(/\s+/g, "-")
+		.replace(/-+/g, "-")
+		.replace(/^-+|-+$/g, "");
+	return safe.slice(0, 64) || "unknown-device";
+};
+
+const parseMetadataCsv = async (csvPath) => {
+	const text = await fsp.readFile(csvPath, "utf8");
+	const lines = text.split(/\r?\n/);
+	const metadata = {};
+
+	for (const line of lines) {
+		if (!line.trim()) {
+			break;
+		}
+		if (line.startsWith("metadata_key")) {
+			continue;
+		}
+		if (line.startsWith("action,")) {
+			break;
+		}
+		const commaIndex = line.indexOf(",");
+		if (commaIndex === -1) {
+			continue;
+		}
+		const key = line.slice(0, commaIndex).trim();
+		const value = line.slice(commaIndex + 1).trim();
+		metadata[key] = value;
+	}
+
+	return metadata;
+};
+
+const escapeCsvValue = (value) => {
+	const raw = String(value ?? "");
+	if (/[",\n]/.test(raw)) {
+		return `"${raw.replace(/"/g, '""')}"`;
+	}
+	return raw;
+};
+
+const buildMasterCsv = (existingText, rowValues) => {
+	const headerLine = ["row_id", ...masterFields].join(",");
+	if (!existingText) {
+		const rowLine = [
+			"1",
+			...rowValues.map(escapeCsvValue),
+		].join(",");
+		return [headerLine, rowLine].join("\n");
+	}
+
+	const lines = existingText.split(/\r?\n/).filter((line) => line.length > 0);
+	const hasHeader = lines.length > 0 && lines[0].startsWith("row_id,");
+	const dataLines = hasHeader ? lines.slice(1) : lines;
+	const nextIndex = dataLines.length + 1;
+	const rowLine = [
+		String(nextIndex),
+		...rowValues.map(escapeCsvValue),
+	].join(",");
+	return [headerLine, ...dataLines, rowLine].join("\n");
+};
+
 const saveFormFile = async (file, targetPath) => {
 	const buffer = Buffer.from(await file.arrayBuffer());
 	await fsp.writeFile(targetPath, buffer);
@@ -65,7 +160,7 @@ const saveFormFile = async (file, targetPath) => {
 const hasRequiredFiles = (manifest) =>
 	Boolean(manifest.laptopAudio && manifest.mobileAudio && manifest.metadataCsv);
 
-const createSessionFolder = async (drive, sessionId) => {
+const createSessionFolder = async (drive, sessionId, deviceId) => {
 	const parentId =
 		process.env.DRIVE_PARENT_FOLDER_ID || defaultDriveParentId || null;
 	const shouldCreate =
@@ -74,11 +169,16 @@ const createSessionFolder = async (drive, sessionId) => {
 		return parentId;
 	}
 
+	const safeDeviceId = sanitizeDriveName(deviceId || "unknown-device");
+	const safeSessionId = sanitizeDriveName(sessionId || "unknown-session");
+
 	if (!parentId) {
-		return ensureFolder(drive, "root", sessionId);
+		const deviceFolderId = await ensureFolder(drive, "root", safeDeviceId);
+		return ensureFolder(drive, deviceFolderId, safeSessionId);
 	}
 
-	return ensureFolder(drive, parentId, sessionId);
+	const deviceFolderId = await ensureFolder(drive, parentId, safeDeviceId);
+	return ensureFolder(drive, deviceFolderId, safeSessionId);
 };
 
 const cleanupSession = async (sessionDir) => {
@@ -126,7 +226,11 @@ const processSession = async (sessionDir, manifest) => {
 	const metadataCsv = path.join(sessionDir, manifest.metadataCsv);
 
 	const drive = getDriveClient();
-	const folderId = await createSessionFolder(drive, manifest.sessionId);
+	const folderId = await createSessionFolder(
+		drive,
+		manifest.sessionId,
+		manifest.deviceId
+	);
 	log("Drive folder", folderId || "root");
 
 	const laptopId = await uploadFileFromPath(
@@ -156,6 +260,27 @@ const processSession = async (sessionDir, manifest) => {
 	);
 	log("Uploaded csv", csvId);
 
+	const metadata = await parseMetadataCsv(metadataCsv);
+	const rowValues = masterFields.map((field) => metadata[field] || "");
+	const masterParentId =
+		process.env.DRIVE_PARENT_FOLDER_ID || defaultDriveParentId || "root";
+	const existingMasterId = await findFileId(
+		drive,
+		masterParentId,
+		masterCsvName
+	);
+	const existingText = existingMasterId
+		? await downloadFileText(drive, existingMasterId)
+		: "";
+	const nextMasterText = buildMasterCsv(existingText, rowValues);
+	const masterId = await upsertTextFile(
+		drive,
+		masterParentId,
+		masterCsvName,
+		nextMasterText
+	);
+	log("Master csv updated", masterId);
+
 	await cleanupSession(sessionDir);
 	log("Cleanup complete", manifest.sessionId);
 };
@@ -181,10 +306,11 @@ export async function POST(request) {
 		const formData = await request.formData();
 		const sessionId = formData.get("sessionId") || "unknown";
 		const device = formData.get("device") || "unknown";
+		const deviceId = formData.get("device_id") || "unknown-device";
 		const audioFile = formData.get("audio");
 		const csvFile = formData.get("metadata_csv");
 
-		log("Incoming upload", { sessionId, device });
+		log("Incoming upload", { sessionId, device, deviceId });
 
 		if (!audioFile || typeof audioFile.arrayBuffer !== "function") {
 			return Response.json(
@@ -198,6 +324,13 @@ export async function POST(request) {
 
 		const manifest = await readManifest(sessionDir);
 		manifest.sessionId = sessionId;
+		if (
+			device === "laptop" ||
+			!manifest.deviceId ||
+			manifest.deviceId === "unknown-device"
+		) {
+			manifest.deviceId = deviceId;
+		}
 
 		if (device === "laptop") {
 			const ext = deriveExtension(audioFile.name);
@@ -220,8 +353,21 @@ export async function POST(request) {
 			log("Saved mobile audio", audioName);
 		}
 
-		await writeManifest(sessionDir, manifest);
-		await maybeStartProcessing(sessionDir, manifest);
+		const latestManifest = await readManifest(sessionDir);
+		const mergedManifest = {
+			...latestManifest,
+			...manifest,
+		};
+		if (
+			device === "mobile" &&
+			latestManifest.deviceId &&
+			latestManifest.deviceId !== "unknown-device"
+		) {
+			mergedManifest.deviceId = latestManifest.deviceId;
+		}
+
+		await writeManifest(sessionDir, mergedManifest);
+		await maybeStartProcessing(sessionDir, mergedManifest);
 
 		return Response.json({ ok: true, sessionId, device });
 	} catch (error) {

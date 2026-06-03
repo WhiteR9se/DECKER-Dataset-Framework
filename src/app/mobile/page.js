@@ -4,6 +4,42 @@ import { useEffect, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { io } from "socket.io-client";
 
+function detectOS(userAgent, platform) {
+	const ua = userAgent.toLowerCase();
+	const pf = platform.toLowerCase();
+	if (ua.includes("windows") || pf.includes("win")) return "Windows";
+	if (ua.includes("mac") || pf.includes("mac")) return "MacOS";
+	if (ua.includes("linux") || pf.includes("linux")) return "Linux";
+	if (ua.includes("android")) return "Android";
+	if (ua.includes("iphone") || ua.includes("ipad")) return "iOS";
+	return "Unknown";
+}
+
+function detectBrowser(userAgent) {
+	const ua = userAgent.toLowerCase();
+	if (ua.includes("edg/")) return "Edge";
+	if (ua.includes("brave")) return "Brave";
+	if (ua.includes("firefox")) return "Firefox";
+	if (ua.includes("safari") && !ua.includes("chrome")) return "Safari";
+	if (ua.includes("chrome")) return "Chrome";
+	return "Unknown";
+}
+
+function sanitizeDevicePart(value) {
+	return String(value || "")
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, "-")
+		.replace(/^-+|-+$/g, "")
+		.slice(0, 24) || "unknown";
+}
+
+function buildDeviceId(osName, browserName) {
+	const osPart = sanitizeDevicePart(osName);
+	const browserPart = sanitizeDevicePart(browserName);
+	const suffix = Math.random().toString(36).slice(2, 8);
+	return `DEVICE_${osPart}_${browserPart}_${suffix}`;
+}
+
 export default function MobilePage() {
 	const searchParams = useSearchParams();
 	const sessionId = searchParams.get("session") || "";
@@ -11,12 +47,26 @@ export default function MobilePage() {
 	const [message, setMessage] = useState("");
 	const [socketStatus, setSocketStatus] = useState("disconnected");
 	const [socketError, setSocketError] = useState("");
+	const [deviceId, setDeviceId] = useState("");
 
 	const socketRef = useRef(null);
 	const streamRef = useRef(null);
 	const mediaRecorderRef = useRef(null);
 	const chunksRef = useRef([]);
 	const recordingRef = useRef(false);
+
+	useEffect(() => {
+		const ua = navigator.userAgent || "";
+		const pf = navigator.platform || "";
+		const stored = window.localStorage.getItem("decker_device_id");
+		if (stored) {
+			setDeviceId(stored);
+			return;
+		}
+		const nextId = buildDeviceId(detectOS(ua, pf), detectBrowser(ua));
+		window.localStorage.setItem("decker_device_id", nextId);
+		setDeviceId(nextId);
+	}, []);
 
 	useEffect(() => {
 		let wakeLock;
@@ -169,6 +219,7 @@ export default function MobilePage() {
 		const formData = new FormData();
 		formData.append("sessionId", sessionId);
 		formData.append("device", "mobile");
+		formData.append("device_id", deviceId || "unknown-device");
 		formData.append(
 			"audio",
 			audioBlob,
@@ -198,8 +249,11 @@ export default function MobilePage() {
 				<p className="text-xs uppercase tracking-[0.3em] text-emerald-700">
 					Mobile Companion
 				</p>
-				<h1 className="text-2xl font-semibold text-slate-900">
-					Session {sessionId || "Not Linked"}
+				<h1 className="flex flex-col gap-2 text-2xl font-semibold text-slate-900">
+					<span>Session</span>
+					<span className="break-all text-base font-semibold text-slate-800 sm:text-lg">
+						{sessionId || "Not Linked"}
+					</span>
 				</h1>
 				<div className="flex items-center gap-3">
 					<span

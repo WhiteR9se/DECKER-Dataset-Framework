@@ -36,6 +36,21 @@ function detectBrowser(userAgent) {
   return "Unknown";
 }
 
+function sanitizeDevicePart(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 24) || "unknown";
+}
+
+function buildDeviceId(osName, browserName) {
+  const osPart = sanitizeDevicePart(osName);
+  const browserPart = sanitizeDevicePart(browserName);
+  const suffix = Math.random().toString(36).slice(2, 8);
+  return `DEVICE_${osPart}_${browserPart}_${suffix}`;
+}
+
 const emptyHardwareInfo = {
   laptop_make: "",
   laptop_model: "",
@@ -58,12 +73,14 @@ const emptyParticipant = {
   profession_field: "",
   keyboard_type: "",
   room_type: "",
+  voip_type: "",
 };
 
 export default function Home() {
   const [sessionId, setSessionId] = useState("");
   const [origin, setOrigin] = useState("");
   const [deviceInfo, setDeviceInfo] = useState({ os: "", browser: "" });
+  const [deviceId, setDeviceId] = useState("");
   const [hardwareInfo, setHardwareInfo] = useState(emptyHardwareInfo);
   const [participant, setParticipant] = useState(emptyParticipant);
   const [activeTab, setActiveTab] = useState("paragraph");
@@ -83,6 +100,18 @@ export default function Home() {
       browser: detectBrowser(ua),
     });
   }, []);
+
+  useEffect(() => {
+    const stored = window.localStorage.getItem("decker_device_id");
+    if (stored) {
+      setDeviceId(stored);
+      return;
+    }
+    if (!deviceInfo.os && !deviceInfo.browser) return;
+    const nextId = buildDeviceId(deviceInfo.os, deviceInfo.browser);
+    window.localStorage.setItem("decker_device_id", nextId);
+    setDeviceId(nextId);
+  }, [deviceInfo]);
 
   useEffect(() => {
     const socketUrl =
@@ -135,12 +164,13 @@ export default function Home() {
   const metadata = useMemo(
     () => ({
       session_id: sessionId,
+      device_id: deviceId,
       operating_system: deviceInfo.os,
       browser_name: deviceInfo.browser,
       ...hardwareInfo,
       ...participant,
     }),
-    [deviceInfo, hardwareInfo, participant, sessionId]
+    [deviceId, deviceInfo, hardwareInfo, participant, sessionId]
   );
 
   const handleParticipantChange = (field, value) => {
@@ -439,6 +469,30 @@ export default function Home() {
                 ))}
               </select>
             </label>
+            <label className="flex flex-col gap-2 text-xs font-medium uppercase tracking-wide text-slate-500">
+              VoIP Type
+              <select
+                value={participant.voip_type}
+                onChange={(event) =>
+                  handleParticipantChange("voip_type", event.target.value)
+                }
+                className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"
+              >
+                <option value="">Select</option>
+                {[
+                  "Zoom",
+                  "Google Meet",
+                  "Microsoft Teams",
+                  "Cisco Webex",
+                  "Zoho Meeting",
+                  "Other",
+                ].map((item) => (
+                  <option key={item} value={item}>
+                    {item}
+                  </option>
+                ))}
+              </select>
+            </label>
           </div>
         </section>
 
@@ -496,6 +550,7 @@ export default function Home() {
           sessionId={sessionId}
           socket={socket}
           metadata={metadata}
+          deviceId={deviceId}
         />
       </main>
     </div>

@@ -1,5 +1,6 @@
 import { google } from "googleapis";
 import fs from "fs";
+import { Readable } from "stream";
 
 export function getDriveClient() {
   if (
@@ -60,6 +61,58 @@ export async function uploadFileFromPath(drive, folderId, filePath, fileName, mi
       mimeType,
       body: fs.createReadStream(filePath),
     },
+    fields: "id, name",
+  });
+
+  return res.data.id;
+}
+
+export async function findFileId(drive, parentId, fileName) {
+  const query = `name='${fileName}' and '${parentId}' in parents and trashed=false`;
+  const res = await drive.files.list({
+    q: query,
+    fields: "files(id, name)",
+    spaces: "drive",
+  });
+
+  if (res.data.files && res.data.files.length > 0) {
+    return res.data.files[0].id;
+  }
+
+  return null;
+}
+
+export async function downloadFileText(drive, fileId) {
+  const res = await drive.files.get(
+    { fileId, alt: "media" },
+    { responseType: "arraybuffer" }
+  );
+
+  return Buffer.from(res.data).toString("utf8");
+}
+
+export async function upsertTextFile(drive, parentId, fileName, content) {
+  const fileId = await findFileId(drive, parentId, fileName);
+  const media = {
+    mimeType: "text/csv",
+    body: Readable.from([content]),
+  };
+
+  if (fileId) {
+    const res = await drive.files.update({
+      fileId,
+      media,
+      fields: "id, name",
+    });
+    return res.data.id;
+  }
+
+  const res = await drive.files.create({
+    requestBody: {
+      name: fileName,
+      parents: parentId ? [parentId] : undefined,
+    },
+    media,
     fields: "id, name",
   });
 

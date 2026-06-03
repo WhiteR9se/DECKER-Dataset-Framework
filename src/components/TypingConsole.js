@@ -21,7 +21,7 @@ function buildCsv(metadata, keystrokes) {
 	].join("\n");
 }
 
-export default function TypingConsole({ sessionId, socket, metadata }) {
+export default function TypingConsole({ sessionId, socket, metadata, deviceId }) {
 	const [status, setStatus] = useState("idle");
 	const [typedText, setTypedText] = useState("");
 	const [micError, setMicError] = useState("");
@@ -177,6 +177,7 @@ export default function TypingConsole({ sessionId, socket, metadata }) {
 		const formData = new FormData();
 		formData.append("sessionId", sessionId);
 		formData.append("device", "laptop");
+		formData.append("device_id", deviceId || "unknown-device");
 		formData.append(
 			"metadata_csv",
 			new Blob([csv], { type: "text/csv" }),
