@@ -9,7 +9,7 @@ NIXPACKS_PYTHON_VERSION = "3.13"
 nixPkgs = ["nodejs_20", "ffmpeg"]
 
 [phases.build]
-cmds = ["npm install", "pip install -r requirements.txt"]
+cmds = ["npm install", "pip install -r requirements.txt", "npm run build"]
 
 [start]
 cmd = "node server.js"
