@@ -65,6 +65,7 @@ const emptyParticipant = {
   keyboard_type: "",
   room_type: "",
   voip_type: "",
+  noise_cancellation: "",
 };
 
 export default function Home() {
@@ -485,6 +486,23 @@ export default function Home() {
                   "Zoho Meeting",
                   "Other",
                 ].map((item) => (
+                  <option key={item} value={item}>
+                    {item}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="flex flex-col gap-2 text-xs font-medium uppercase tracking-wide text-slate-500">
+              Noise Cancellation Mode
+              <select
+                value={participant.noise_cancellation}
+                onChange={(event) =>
+                  handleParticipantChange("noise_cancellation", event.target.value)
+                }
+                className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"
+              >
+                <option value="">Select</option>
+                {["On", "Off"].map((item) => (
                   <option key={item} value={item}>
                     {item}
                   </option>

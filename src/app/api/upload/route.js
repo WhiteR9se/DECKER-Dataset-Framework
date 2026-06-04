@@ -45,6 +45,7 @@ const masterFields = [
 	"keyboard_type",
 	"room_type",
 	"voip_type",
+	"noise_cancellation",
 ];
 
 const log = (...args) => {
