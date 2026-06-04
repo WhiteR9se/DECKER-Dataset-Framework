@@ -1,0 +1,2744 @@
+========================================
+FILE: src/python_scripts/sync_audio.py
+========================================
+import sys
+import os
+import numpy as np
+import ffmpeg
+import librosa
+from scipy.io import wavfile
+from scipy import signal
+
+
+def convert_to_wav(input_path, output_path):
+	print(f"[sync_audio] ffmpeg input: {input_path}")
+	print(f"[sync_audio] ffmpeg output: {output_path}")
+	(
+		ffmpeg.input(input_path)
+		.output(output_path, ac=1, ar=48000, format="wav")
+		.overwrite_output()
+		.run(quiet=False)
+	)
+
+
+def load_wav(path):
+	rate, data = wavfile.read(path)
+	if data.ndim > 1:
+		data = data.mean(axis=1)
+	return rate, data.astype(np.float32)
+
+
+def bandpass_filter(data, rate, low=2500, high=3500):
+	nyquist = rate / 2
+	b, a = signal.butter(4, [low / nyquist, high / nyquist], btype="band")
+	return signal.filtfilt(b, a, data)
+
+
+def find_offset(laptop_data, mobile_data):
+	correlation = signal.correlate(laptop_data, mobile_data, mode="full")
+	lag = int(np.argmax(correlation) - (len(mobile_data) - 1))
+	return lag
+
+
+def align_streams(laptop_data, mobile_data, lag):
+	if lag > 0:
+		laptop_data = laptop_data[lag:]
+	elif lag < 0:
+		mobile_data = mobile_data[-lag:]
+
+	min_len = min(len(laptop_data), len(mobile_data))
+	return laptop_data[:min_len], mobile_data[:min_len]
+
+
+def to_int16(data):
+	if data.size == 0:
+		return data.astype(np.int16)
+	normalized = librosa.util.normalize(data)
+	scaled = np.clip(normalized, -1.0, 1.0)
+	return (scaled * 32767).astype(np.int16)
+
+
+def main():
+	if len(sys.argv) < 5:
+		raise RuntimeError(
+			"Usage: sync_audio.py <session_dir> <session_id> <laptop_input> <mobile_input>"
+		)
+
+	session_dir = sys.argv[1]
+	session_id = sys.argv[2]
+	laptop_input = sys.argv[3]
+	mobile_input = sys.argv[4]
+
+	laptop_wav = os.path.join(session_dir, "laptop_raw.wav")
+	mobile_wav = os.path.join(session_dir, "mobile_raw.wav")
+
+	convert_to_wav(laptop_input, laptop_wav)
+	convert_to_wav(mobile_input, mobile_wav)
+
+	print("[sync_audio] Loading wav files")
+	rate_lap, lap_data = load_wav(laptop_wav)
+	rate_mob, mob_data = load_wav(mobile_wav)
+
+	if rate_lap != 48000 or rate_mob != 48000:
+		raise RuntimeError("Unexpected sample rate after conversion")
+
+	print("[sync_audio] Applying bandpass filter")
+	lap_filtered = bandpass_filter(lap_data, rate_lap)
+	mob_filtered = bandpass_filter(mob_data, rate_mob)
+
+	lag = find_offset(lap_filtered, mob_filtered)
+	print(f"[sync_audio] Detected lag: {lag} samples")
+	aligned_lap, aligned_mob = align_streams(lap_data, mob_data, lag)
+	print(
+		f"[sync_audio] Aligned lengths: {len(aligned_lap)} / {len(aligned_mob)}"
+	)
+
+	synced_lap_path = os.path.join(session_dir, f"{session_id}_laptop_synced.wav")
+	synced_mob_path = os.path.join(session_dir, f"{session_id}_mobile_synced.wav")
+
+	print("[sync_audio] Writing synced wav files")
+	wavfile.write(synced_lap_path, rate_lap, to_int16(aligned_lap))
+	wavfile.write(synced_mob_path, rate_mob, to_int16(aligned_mob))
+	print("[sync_audio] Done")
+
+
+if __name__ == "__main__":
+	main()
+
+
+========================================
+FILE: src/python_scripts/verify_beep_alignment.py
+========================================
+#!/usr/bin/env python3
+import argparse
+import csv
+import math
+import os
+from typing import List, Tuple
+
+import librosa
+import numpy as np
+
+
+def read_keystroke_timestamps(csv_path: str) -> List[int]:
+    timestamps = []
+    with open(csv_path, newline="", encoding="utf-8") as handle:
+        reader = csv.reader(handle)
+        rows = list(reader)
+
+    header_index = None
+    for idx, row in enumerate(rows):
+        if row and row[0].strip() == "action" and len(row) >= 3:
+            header_index = idx
+            break
+
+    if header_index is None:
+        return timestamps
+
+    for row in rows[header_index + 1 :]:
+        if not row or len(row) < 3:
+            continue
+        try:
+            timestamps.append(int(row[2]))
+        except ValueError:
+            continue
+
+    return timestamps
+
+
+def detect_beep_time(audio_path: str, target_freq_hz: float = 3000.0) -> float:
+    y, sr = librosa.load(audio_path, sr=None, mono=True)
+    if y.size == 0:
+        raise ValueError("Audio file is empty")
+
+    n_fft = 2048
+    hop_length = 512
+    stft = librosa.stft(y, n_fft=n_fft, hop_length=hop_length)
+    magnitude = np.abs(stft)
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
+    freq_idx = int(np.argmin(np.abs(freqs - target_freq_hz)))
+
+    band_energy = magnitude[freq_idx]
+    if band_energy.size == 0:
+        raise ValueError("Failed to compute band energy")
+
+    mean = float(np.mean(band_energy))
+    std = float(np.std(band_energy))
+    threshold = mean + 5.0 * std
+
+    onset_frame = None
+    for idx, value in enumerate(band_energy):
+        if value >= threshold:
+            onset_frame = idx
+            break
+
+    if onset_frame is None:
+        # Fall back to max energy frame
+        onset_frame = int(np.argmax(band_energy))
+
+    return librosa.frames_to_time(onset_frame, sr=sr, hop_length=hop_length)
+
+
+def summarize_alignment(audio_path: str, csv_path: str) -> Tuple[float, float, float]:
+    beep_time = detect_beep_time(audio_path)
+    timestamps = read_keystroke_timestamps(csv_path)
+    if not timestamps:
+        raise ValueError("No keystroke timestamps found in CSV")
+
+    first_key_ms = min(timestamps)
+    first_key_sec = first_key_ms / 1000.0
+    offset_sec = beep_time - 0.0
+
+    return beep_time, first_key_sec, offset_sec
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Verify that keystroke timestamps are aligned to the laptop beep."
+    )
+    parser.add_argument("--audio", required=True, help="Path to synced laptop WAV")
+    parser.add_argument("--csv", required=True, help="Path to metadata CSV")
+    args = parser.parse_args()
+
+    audio_path = os.path.expanduser(args.audio)
+    csv_path = os.path.expanduser(args.csv)
+
+    beep_time, first_key_sec, offset_sec = summarize_alignment(audio_path, csv_path)
+
+    print("Beep time in audio (sec):", f"{beep_time:.4f}")
+    print("First keystroke (sec from CSV):", f"{first_key_sec:.4f}")
+    print("CSV zero reference (sec): 0.0000")
+    print("Audio beep offset from CSV zero (sec):", f"{offset_sec:.4f}")
+    if math.isfinite(first_key_sec):
+        print("Expected: first keystroke should be shortly after beep.")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
+========================================
+FILE: src/app/api/oauth/route.js
+========================================
+import { google } from "googleapis";
+
+export async function GET() {
+  try {
+    if (!process.env.CLIENT_ID || !process.env.CLIENT_SECRET || !process.env.OAUTH_REDIRECT_URI) {
+      return Response.json({ error: "Missing OAuth env vars" }, { status: 500 });
+    }
+
+    const oauth2Client = new google.auth.OAuth2(
+      process.env.CLIENT_ID,
+      process.env.CLIENT_SECRET,
+      process.env.OAUTH_REDIRECT_URI
+    );
+
+    const url = oauth2Client.generateAuthUrl({
+      access_type: "offline",
+      prompt: "consent",
+      scope: [
+        "https://www.googleapis.com/auth/drive.file",
+        "https://www.googleapis.com/auth/drive",
+      ],
+    });
+
+    return Response.redirect(url);
+  } catch (error) {
+    console.error("OAuth URL error", error);
+    return Response.json({ error: "Failed to generate OAuth URL" }, { status: 500 });
+  }
+}
+
+
+========================================
+FILE: src/app/api/oauth2callback/route.js
+========================================
+import { google } from "googleapis";
+
+function escapeHtml(text) {
+  return String(text).replace(/[&<>"']/g, (char) => {
+    switch (char) {
+      case "&":
+        return "&amp;";
+      case "<":
+        return "&lt;";
+      case ">":
+        return "&gt;";
+      case '"':
+        return "&quot;";
+      case "'":
+        return "&#39;";
+      default:
+        return char;
+    }
+  });
+}
+
+export async function GET(request) {
+  try {
+    if (!process.env.CLIENT_ID || !process.env.CLIENT_SECRET || !process.env.OAUTH_REDIRECT_URI) {
+      return new Response("Missing OAuth env vars", { status: 500 });
+    }
+
+    const oauth2Client = new google.auth.OAuth2(
+      process.env.CLIENT_ID,
+      process.env.CLIENT_SECRET,
+      process.env.OAUTH_REDIRECT_URI
+    );
+
+    const { searchParams } = new URL(request.url);
+    const code = searchParams.get("code");
+
+    if (!code) {
+      return new Response("Missing authorization code", { status: 400 });
+    }
+
+    const { tokens } = await oauth2Client.getToken(code);
+    oauth2Client.setCredentials(tokens);
+
+    if (!tokens.refresh_token) {
+      return new Response(
+        "No refresh token issued. Revoke app access and try again.",
+        { status: 200 }
+      );
+    }
+
+    const safeRefreshToken = escapeHtml(tokens.refresh_token);
+    const html = `
+      <h1>Authentication Successful</h1>
+      <p>Copy your refresh token and set it as REFRESH_TOKEN.</p>
+      <textarea readonly style="width: 100%; height: 140px;">${safeRefreshToken}</textarea>
+    `;
+
+    return new Response(html, {
+      status: 200,
+      headers: { "content-type": "text/html" },
+    });
+  } catch (error) {
+    console.error("OAuth callback error", error);
+    return new Response("OAuth callback error", { status: 500 });
+  }
+}
+
+
+========================================
+FILE: src/app/api/get-upload-token/route.js
+========================================
+export async function POST() {
+  try {
+    if (!process.env.CLIENT_ID || !process.env.CLIENT_SECRET || !process.env.REFRESH_TOKEN) {
+      return Response.json({ error: "Missing OAuth env vars" }, { status: 500 });
+    }
+
+    const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id: process.env.CLIENT_ID,
+        client_secret: process.env.CLIENT_SECRET,
+        refresh_token: process.env.REFRESH_TOKEN,
+        grant_type: "refresh_token",
+      }),
+    });
+
+    const tokenData = await tokenResponse.json();
+
+    if (!tokenData.access_token) {
+      throw new Error("Failed to get access token");
+    }
+
+    return Response.json({
+      access_token: tokenData.access_token,
+      rootFolderId: process.env.DRIVE_FOLDER_ID,
+    });
+  } catch (error) {
+    console.error("Token error", error);
+    return Response.json({ error: error.message }, { status: 500 });
+  }
+}
+
+
+========================================
+FILE: src/app/api/upload/route.js
+========================================
+import { promises as fsp } from "fs";
+import path from "path";
+import os from "os";
+import { execFile } from "child_process";
+import {
+	ensureFolder,
+	downloadFileText,
+	findFileId,
+	getDriveClient,
+	upsertTextFile,
+	uploadFileFromPath,
+} from "../../../lib/googleDriveClient";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+const uploadRoot = path.join(os.tmpdir(), "decker_sessions");
+const manifestFile = "manifest.json";
+const processingLock = "processing.lock";
+const defaultDriveParentId = "1VlFQjn2t-H7_cihRnjmjNjMK3lGt-5xN";
+const pythonPath = process.env.PYTHON_PATH || "python3";
+const masterCsvName = "master_sessions.csv";
+
+const masterFields = [
+	"session_id",
+	"device_id",
+	"operating_system",
+	"browser_name",
+	"laptop_make",
+	"laptop_model",
+	"cpu_model",
+	"ram_gb",
+	"screen_resolution",
+	"battery_status",
+	"wifi_signal_strength",
+	"audio_device_name",
+	"audio_driver_version",
+	"keyboard_layout_locale",
+	"person_no",
+	"age_range",
+	"gender",
+	"dominant_hand",
+	"years_keyboard_use",
+	"profession_field",
+	"keyboard_type",
+	"room_type",
+	"voip_type",
+];
+
+const log = (...args) => {
+	console.log("[upload]", ...args);
+};
+
+const execFileAsync = (command, args) =>
+	new Promise((resolve, reject) => {
+		execFile(command, args, (error, stdout, stderr) => {
+			if (error) {
+				reject({ error, stdout, stderr });
+				return;
+			}
+			resolve({ stdout, stderr });
+		});
+	});
+
+const ensureDir = async (dirPath) => {
+	await fsp.mkdir(dirPath, { recursive: true });
+};
+
+const readManifest = async (sessionDir) => {
+	try {
+		const data = await fsp.readFile(path.join(sessionDir, manifestFile), "utf8");
+		return JSON.parse(data);
+	} catch (error) {
+		return { sessionId: null, deviceId: null };
+	}
+};
+
+const writeManifest = async (sessionDir, manifest) => {
+	await fsp.writeFile(
+		path.join(sessionDir, manifestFile),
+		JSON.stringify(manifest, null, 2)
+	);
+};
+
+const deriveExtension = (fileName) => {
+	const ext = path.extname(fileName || "").toLowerCase();
+	return ext || ".webm";
+};
+
+const sanitizeDriveName = (value) => {
+	const safe = String(value || "")
+		.replace(/[\\/?%*:|"<>]/g, "-")
+		.replace(/\s+/g, "-")
+		.replace(/-+/g, "-")
+		.replace(/^-+|-+$/g, "");
+	return safe.slice(0, 64) || "unknown-device";
+};
+
+const parseMetadataCsv = async (csvPath) => {
+	const text = await fsp.readFile(csvPath, "utf8");
+	const lines = text.split(/\r?\n/);
+	const metadata = {};
+
+	for (const line of lines) {
+		if (!line.trim()) {
+			break;
+		}
+		if (line.startsWith("metadata_key")) {
+			continue;
+		}
+		if (line.startsWith("action,")) {
+			break;
+		}
+		const commaIndex = line.indexOf(",");
+		if (commaIndex === -1) {
+			continue;
+		}
+		const key = line.slice(0, commaIndex).trim();
+		const value = line.slice(commaIndex + 1).trim();
+		metadata[key] = value;
+	}
+
+	return metadata;
+};
+
+const escapeCsvValue = (value) => {
+	const raw = String(value ?? "");
+	if (/[",\n]/.test(raw)) {
+		return `"${raw.replace(/"/g, '""')}"`;
+	}
+	return raw;
+};
+
+const buildMasterCsv = (existingText, rowValues) => {
+	const headerLine = ["row_id", ...masterFields].join(",");
+	if (!existingText) {
+		const rowLine = [
+			"1",
+			...rowValues.map(escapeCsvValue),
+		].join(",");
+		return [headerLine, rowLine].join("\n");
+	}
+
+	const lines = existingText.split(/\r?\n/).filter((line) => line.length > 0);
+	const hasHeader = lines.length > 0 && lines[0].startsWith("row_id,");
+	const dataLines = hasHeader ? lines.slice(1) : lines;
+	const nextIndex = dataLines.length + 1;
+	const rowLine = [
+		String(nextIndex),
+		...rowValues.map(escapeCsvValue),
+	].join(",");
+	return [headerLine, ...dataLines, rowLine].join("\n");
+};
+
+const saveFormFile = async (file, targetPath) => {
+	const buffer = Buffer.from(await file.arrayBuffer());
+	await fsp.writeFile(targetPath, buffer);
+};
+
+const hasRequiredFiles = (manifest) =>
+	Boolean(manifest.laptopAudio && manifest.mobileAudio && manifest.metadataCsv);
+
+const createSessionFolder = async (drive, sessionId, deviceId) => {
+	const parentId =
+		process.env.DRIVE_PARENT_FOLDER_ID || defaultDriveParentId || null;
+	const shouldCreate =
+		(process.env.DRIVE_CREATE_SESSION_FOLDER ?? "true") === "true";
+	if (!shouldCreate) {
+		return parentId;
+	}
+
+	const safeDeviceId = sanitizeDriveName(deviceId || "unknown-device");
+	const safeSessionId = sanitizeDriveName(sessionId || "unknown-session");
+
+	if (!parentId) {
+		const deviceFolderId = await ensureFolder(drive, "root", safeDeviceId);
+		return ensureFolder(drive, deviceFolderId, safeSessionId);
+	}
+
+	const deviceFolderId = await ensureFolder(drive, parentId, safeDeviceId);
+	return ensureFolder(drive, deviceFolderId, safeSessionId);
+};
+
+const cleanupSession = async (sessionDir) => {
+	const files = await fsp.readdir(sessionDir);
+	await Promise.all(
+		files.map((file) => fsp.unlink(path.join(sessionDir, file)))
+	);
+	await fsp.rmdir(sessionDir);
+};
+
+const processSession = async (sessionDir, manifest) => {
+	const scriptPath = path.join(
+		process.cwd(),
+		"src",
+		"python_scripts",
+		"sync_audio.py"
+	);
+
+	const laptopPath = path.join(sessionDir, manifest.laptopAudio);
+	const mobilePath = path.join(sessionDir, manifest.mobileAudio);
+
+	log("Starting sync", manifest.sessionId);
+	log("Laptop input", laptopPath);
+	log("Mobile input", mobilePath);
+	log("Python", pythonPath);
+
+	const { stdout, stderr } = await execFileAsync(pythonPath, [
+		scriptPath,
+		sessionDir,
+		manifest.sessionId,
+		laptopPath,
+		mobilePath,
+	]);
+	if (stdout) log("Python stdout", stdout.trim());
+	if (stderr) log("Python stderr", stderr.trim());
+
+	const syncedLaptop = path.join(
+		sessionDir,
+		`${manifest.sessionId}_laptop_synced.wav`
+	);
+	const syncedMobile = path.join(
+		sessionDir,
+		`${manifest.sessionId}_mobile_synced.wav`
+	);
+	const metadataCsv = path.join(sessionDir, manifest.metadataCsv);
+
+	const drive = getDriveClient();
+	const folderId = await createSessionFolder(
+		drive,
+		manifest.sessionId,
+		manifest.deviceId
+	);
+	log("Drive folder", folderId || "root");
+
+	const laptopId = await uploadFileFromPath(
+		drive,
+		folderId,
+		syncedLaptop,
+		path.basename(syncedLaptop),
+		"audio/wav"
+	);
+	log("Uploaded laptop", laptopId);
+
+	const mobileId = await uploadFileFromPath(
+		drive,
+		folderId,
+		syncedMobile,
+		path.basename(syncedMobile),
+		"audio/wav"
+	);
+	log("Uploaded mobile", mobileId);
+
+	const csvId = await uploadFileFromPath(
+		drive,
+		folderId,
+		metadataCsv,
+		path.basename(metadataCsv),
+		"text/csv"
+	);
+	log("Uploaded csv", csvId);
+
+	const metadata = await parseMetadataCsv(metadataCsv);
+	const rowValues = masterFields.map((field) => metadata[field] || "");
+	const masterParentId =
+		process.env.DRIVE_PARENT_FOLDER_ID || defaultDriveParentId || "root";
+	const existingMasterId = await findFileId(
+		drive,
+		masterParentId,
+		masterCsvName
+	);
+	const existingText = existingMasterId
+		? await downloadFileText(drive, existingMasterId)
+		: "";
+	const nextMasterText = buildMasterCsv(existingText, rowValues);
+	const masterId = await upsertTextFile(
+		drive,
+		masterParentId,
+		masterCsvName,
+		nextMasterText
+	);
+	log("Master csv updated", masterId);
+
+	await cleanupSession(sessionDir);
+	log("Cleanup complete", manifest.sessionId);
+};
+
+const maybeStartProcessing = async (sessionDir, manifest) => {
+	if (!hasRequiredFiles(manifest)) return;
+
+	const lockPath = path.join(sessionDir, processingLock);
+	try {
+		await fsp.access(lockPath);
+		return;
+	} catch (error) {
+		await fsp.writeFile(lockPath, "processing");
+	}
+
+	processSession(sessionDir, manifest).catch((error) => {
+		console.error("Session processing failed", error);
+	});
+};
+
+export async function POST(request) {
+	try {
+		const formData = await request.formData();
+		const sessionId = formData.get("sessionId") || "unknown";
+		const device = formData.get("device") || "unknown";
+		const deviceId = formData.get("device_id") || "unknown-device";
+		const audioFile = formData.get("audio");
+		const csvFile = formData.get("metadata_csv");
+
+		log("Incoming upload", { sessionId, device, deviceId });
+
+		if (!audioFile || typeof audioFile.arrayBuffer !== "function") {
+			return Response.json(
+				{ ok: false, error: "Missing audio file" },
+				{ status: 400 }
+			);
+		}
+
+		const sessionDir = path.join(uploadRoot, sessionId);
+		await ensureDir(sessionDir);
+
+		const manifest = await readManifest(sessionDir);
+		manifest.sessionId = sessionId;
+		if (
+			device === "laptop" ||
+			!manifest.deviceId ||
+			manifest.deviceId === "unknown-device"
+		) {
+			manifest.deviceId = deviceId;
+		}
+
+		if (device === "laptop") {
+			const ext = deriveExtension(audioFile.name);
+			const audioName = `laptop_input${ext}`;
+			await saveFormFile(audioFile, path.join(sessionDir, audioName));
+			manifest.laptopAudio = audioName;
+			log("Saved laptop audio", audioName);
+
+			if (csvFile && typeof csvFile.arrayBuffer === "function") {
+				const csvName = "metadata.csv";
+				await saveFormFile(csvFile, path.join(sessionDir, csvName));
+				manifest.metadataCsv = csvName;
+				log("Saved metadata csv", csvName);
+			}
+		} else if (device === "mobile") {
+			const ext = deriveExtension(audioFile.name);
+			const audioName = `mobile_input${ext}`;
+			await saveFormFile(audioFile, path.join(sessionDir, audioName));
+			manifest.mobileAudio = audioName;
+			log("Saved mobile audio", audioName);
+		}
+
+		const latestManifest = await readManifest(sessionDir);
+		const mergedManifest = {
+			...latestManifest,
+			...manifest,
+		};
+		if (
+			device === "mobile" &&
+			latestManifest.deviceId &&
+			latestManifest.deviceId !== "unknown-device"
+		) {
+			mergedManifest.deviceId = latestManifest.deviceId;
+		}
+
+		await writeManifest(sessionDir, mergedManifest);
+		await maybeStartProcessing(sessionDir, mergedManifest);
+
+		return Response.json({ ok: true, sessionId, device });
+	} catch (error) {
+		console.error("Upload handler error", error);
+		return Response.json(
+			{ ok: false, error: "Invalid upload" },
+			{ status: 400 }
+		);
+	}
+}
+
+
+========================================
+FILE: src/app/globals.css
+========================================
+@import "tailwindcss";
+
+:root {
+  --background: #f5f2ec;
+  --foreground: #12110f;
+  --accent: #0f766e;
+  --accent-strong: #0b3b37;
+  --panel: #fff7ea;
+  --panel-border: #eadbc8;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-space-grotesk);
+  --font-mono: var(--font-plex-mono);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #0a0a0a;
+    --foreground: #ededed;
+  }
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+}
+
+@layer utilities {
+  .fade-in {
+    animation: fade-in 0.6s ease-out both;
+  }
+
+  .rise-in {
+    animation: rise-in 0.7s ease-out both;
+  }
+
+  .stagger-1 {
+    animation-delay: 0.1s;
+  }
+
+  .stagger-2 {
+    animation-delay: 0.2s;
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes rise-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+
+========================================
+FILE: src/app/mobile/MobileClient.js
+========================================
+"use client";
+
+import { useEffect, useRef, useState } from "react";
+import { useSearchParams } from "next/navigation";
+import { io } from "socket.io-client";
+
+function detectOS(userAgent, platform) {
+	const ua = userAgent.toLowerCase();
+	const pf = platform.toLowerCase();
+	if (ua.includes("windows") || pf.includes("win")) return "Windows";
+	if (ua.includes("mac") || pf.includes("mac")) return "MacOS";
+	if (ua.includes("linux") || pf.includes("linux")) return "Linux";
+	if (ua.includes("android")) return "Android";
+	if (ua.includes("iphone") || ua.includes("ipad")) return "iOS";
+	return "Unknown";
+}
+
+function detectBrowser(userAgent) {
+	const ua = userAgent.toLowerCase();
+	if (ua.includes("edg/")) return "Edge";
+	if (ua.includes("brave")) return "Brave";
+	if (ua.includes("firefox")) return "Firefox";
+	if (ua.includes("safari") && !ua.includes("chrome")) return "Safari";
+	if (ua.includes("chrome")) return "Chrome";
+	return "Unknown";
+}
+
+function sanitizeDevicePart(value) {
+	return String(value || "")
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, "-")
+		.replace(/^-+|-+$/g, "")
+		.slice(0, 24) || "unknown";
+}
+
+function buildDeviceId(osName, browserName) {
+	const osPart = sanitizeDevicePart(osName);
+	const browserPart = sanitizeDevicePart(browserName);
+	const suffix = Math.random().toString(36).slice(2, 8);
+	return `DEVICE_${osPart}_${browserPart}_${suffix}`;
+}
+
+export default function MobileClient() {
+	const searchParams = useSearchParams();
+	const sessionId = searchParams.get("session") || "";
+	const [status, setStatus] = useState("idle");
+	const [message, setMessage] = useState("");
+	const [socketStatus, setSocketStatus] = useState("disconnected");
+	const [socketError, setSocketError] = useState("");
+	const [deviceId, setDeviceId] = useState("");
+
+	const socketRef = useRef(null);
+	const streamRef = useRef(null);
+	const mediaRecorderRef = useRef(null);
+	const chunksRef = useRef([]);
+	const recordingRef = useRef(false);
+
+	useEffect(() => {
+		const ua = navigator.userAgent || "";
+		const pf = navigator.platform || "";
+		const stored = window.localStorage.getItem("decker_device_id");
+		if (stored) {
+			setDeviceId(stored);
+			return;
+		}
+		const nextId = buildDeviceId(detectOS(ua, pf), detectBrowser(ua));
+		window.localStorage.setItem("decker_device_id", nextId);
+		setDeviceId(nextId);
+	}, []);
+
+	useEffect(() => {
+		let wakeLock;
+		const requestWakeLock = async () => {
+			try {
+				if (navigator.wakeLock) {
+					wakeLock = await navigator.wakeLock.request("screen");
+				}
+			} catch (error) {
+				console.warn("Wake lock not available", error);
+			}
+		};
+
+		requestWakeLock();
+
+		return () => {
+			if (wakeLock) {
+				wakeLock.release();
+			}
+		};
+	}, []);
+
+	useEffect(() => {
+		const socketUrl =
+			process.env.NEXT_PUBLIC_SOCKET_URL || window.location.origin;
+		const socket = io(socketUrl, {
+			path: "/socket.io",
+		});
+		socketRef.current = socket;
+
+		socket.on("connect", () => {
+			setSocketStatus("connected");
+			setSocketError("");
+			if (sessionId) {
+				socket.emit("join_room", { sessionId });
+				setMessage(`Joining session ${sessionId}...`);
+			}
+		});
+
+		socket.on("disconnect", (reason) => {
+			setSocketStatus("disconnected");
+			setSocketError(reason ? `Disconnected: ${reason}` : "");
+		});
+
+		socket.on("connect_error", (error) => {
+			setSocketStatus("error");
+			const detail =
+				error?.description || error?.message || "Socket connection failed";
+			setSocketError(detail);
+		});
+
+		socket.on("devices_paired", () => {
+			setMessage("Laptop paired. Waiting for recording trigger...");
+		});
+
+		socket.on("trigger_recording", () => {
+			startRecording();
+		});
+
+		socket.on("stop_recording", () => {
+			console.log("[mobile] stop_recording received");
+			setMessage("Stop command received. Finalizing upload...");
+			stopRecording(true);
+			socket.emit("stop_recording_ack", { sessionId });
+		});
+
+		return () => {
+			socket.disconnect();
+		};
+	}, [sessionId]);
+
+	useEffect(() => {
+		if (!sessionId) return;
+		if (!socketRef.current?.connected) return;
+		socketRef.current.emit("join_room", { sessionId });
+		setMessage(`Joining session ${sessionId}...`);
+	}, [sessionId]);
+
+	useEffect(() => {
+		let cancelled = false;
+		if (!navigator?.mediaDevices?.getUserMedia) {
+			setMessage("Microphone API unavailable. Use HTTPS or a supported browser.");
+			return () => {
+				cancelled = true;
+			};
+		}
+		navigator.mediaDevices
+			.getUserMedia({
+				audio: {
+					echoCancellation: false,
+					noiseSuppression: false,
+					autoGainControl: false,
+				},
+			})
+			.then((stream) => {
+				if (cancelled) return;
+				streamRef.current = stream;
+				const recorder = new MediaRecorder(stream);
+				recorder.ondataavailable = (event) => {
+					if (event.data && event.data.size > 0) {
+						chunksRef.current.push(event.data);
+					}
+				};
+				mediaRecorderRef.current = recorder;
+			})
+			.catch((error) => {
+				console.error("Microphone error", error);
+				setMessage("Microphone permission is required.");
+			});
+
+		return () => {
+			cancelled = true;
+			streamRef.current?.getTracks().forEach((track) => track.stop());
+		};
+	}, []);
+
+	const startRecording = () => {
+		if (!mediaRecorderRef.current) return;
+		if (recordingRef.current) return;
+		if (mediaRecorderRef.current?.state === "recording") return;
+		chunksRef.current = [];
+		mediaRecorderRef.current.start(1000);
+		setStatus("recording");
+		recordingRef.current = true;
+		setMessage("Recording on mobile device...");
+	};
+
+	const stopRecording = async (forceStop = false) => {
+		if (!forceStop && status !== "recording") return;
+		if (
+			!forceStop &&
+			!recordingRef.current &&
+			mediaRecorderRef.current?.state !== "recording"
+		) {
+			return;
+		}
+
+		recordingRef.current = false;
+		if (mediaRecorderRef.current?.state === "recording") {
+			await new Promise((resolve) => {
+				mediaRecorderRef.current.onstop = resolve;
+				mediaRecorderRef.current.stop();
+			});
+		}
+
+		const audioBlob = new Blob(chunksRef.current, {
+			type: "audio/webm",
+		});
+
+		const formData = new FormData();
+		formData.append("sessionId", sessionId);
+		formData.append("device", "mobile");
+		formData.append("device_id", deviceId || "unknown-device");
+		formData.append(
+			"audio",
+			audioBlob,
+			`mobile_audio_${sessionId || "unknown"}.webm`
+		);
+
+		try {
+			const apiBase =
+				process.env.NEXT_PUBLIC_SOCKET_URL || window.location.origin;
+			const response = await fetch(`${apiBase}/api/upload`, {
+				method: "POST",
+				body: formData,
+			});
+			if (!response.ok) {
+				throw new Error("Upload failed");
+			}
+			setMessage("Mobile upload completed.");
+		} catch (error) {
+			console.error("Upload error", error);
+			setMessage("Mobile upload failed. Please retry.");
+		}
+
+		setStatus("idle");
+	};
+
+	return (
+		<div className="min-h-screen bg-[radial-gradient(circle_at_top,_#ecfdf3,_#f0f7f5_55%,_#d7ebe6_100%)] px-6 py-10 text-slate-900">
+			<div className="mx-auto flex max-w-md flex-col gap-6 rounded-3xl border border-emerald-100 bg-white/90 p-6 shadow-[0_20px_40px_rgba(15,23,42,0.12)]">
+				<p className="text-xs uppercase tracking-[0.3em] text-emerald-700">
+					Mobile Companion
+				</p>
+				<h1 className="flex flex-col gap-2 text-2xl font-semibold text-slate-900">
+					<span>Session</span>
+					<span className="break-all text-base font-semibold text-slate-800 sm:text-lg">
+						{sessionId || "Not Linked"}
+					</span>
+				</h1>
+				<div className="flex items-center gap-3">
+					<span
+						className={`h-4 w-4 rounded-full ${
+							status === "recording"
+								? "bg-emerald-500 shadow-[0_0_14px_rgba(16,185,129,0.7)] animate-pulse"
+								: "bg-slate-300"
+						}`}
+					/>
+					<p className="text-sm font-medium text-slate-700">
+						{status === "recording"
+							? "Microphone is RECORDING"
+							: "Microphone is IDLE"}
+					</p>
+				</div>
+				<p className="rounded-2xl border border-emerald-100 bg-emerald-50 px-4 py-3 text-sm text-emerald-800">
+					{message || "Waiting for laptop connection..."}
+				</p>
+				<p className="text-xs text-slate-500">
+					Socket: {socketStatus}
+					{socketError ? ` (${socketError})` : ""}
+				</p>
+				<p className="text-xs text-slate-500">
+					Keep this screen awake during recording. Wake lock is requested
+					automatically.
+				</p>
+			</div>
+		</div>
+	);
+}
+
+
+========================================
+FILE: src/app/mobile/page.js
+========================================
+import { Suspense } from "react";
+import MobileClient from "./MobileClient";
+
+export default function MobilePage() {
+	return (
+		<Suspense
+			fallback={
+				<div className="min-h-screen bg-[radial-gradient(circle_at_top,_#ecfdf3,_#f0f7f5_55%,_#d7ebe6_100%)] px-6 py-10 text-slate-900">
+					<div className="mx-auto flex max-w-md flex-col gap-4 rounded-3xl border border-emerald-100 bg-white/90 p-6 shadow-[0_20px_40px_rgba(15,23,42,0.12)]">
+						<p className="text-xs uppercase tracking-[0.3em] text-emerald-700">
+							Mobile Companion
+						</p>
+						<p className="text-sm text-slate-600">Loading session...</p>
+					</div>
+				</div>
+			}
+		>
+			<MobileClient />
+		</Suspense>
+	);
+}
+
+
+========================================
+FILE: src/app/page.tsx
+========================================
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import { io } from "socket.io-client";
+import type { Socket } from "socket.io-client";
+import QRCodeDisplay from "../components/QRCodeDisplay";
+import TerminalScripts from "../components/TerminalScripts";
+import TypingConsole from "../components/TypingConsole";
+
+const paragraphText = `The quick brown fox jumps over the lazy dog while amazing zebras quietly vex jumpy kids, proving every letter is present. Pack my box with five dozen liquor jugs to verify the alphabet twice.
+Digits appear forward and backward: 1234567890 then 0987654321, followed by sequences like 2468, 13579, and 314159.
+Now we add punctuation: . , ; : ? ! ' " - _ ( ) [ ] { } /
+
+Symbols and operators: @ # $ % ^ & * + = < > | ~
+To include uppercase properly, acronyms like NASA, USA, UN, AI, ML, and HTML are written in full caps.
+Typing speed and accuracy will be measured across every key, ensuring consistency of captured events.
+Finally, we conclude with a mix: The year is 2025; version v1.0-beta includes features [alpha], {bravo}, and (charlie), all typed carefully for complete coverage of the QWERTY keyboard.`;
+
+const specialKeyText = `1) Tab  2) Backspace  3) Delete  4) Arrow Up  5) Arrow Down  6) Arrow Left  7) Arrow Right  8) Esc  9) F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12  10) Caps Lock (press once to enable, once to disable)  11) Enter (to confirm completion)`;
+
+function detectOS(userAgent: string, platform: string) {
+  const ua = userAgent.toLowerCase();
+  const pf = platform.toLowerCase();
+  if (ua.includes("windows") || pf.includes("win")) return "Windows";
+  if (ua.includes("mac") || pf.includes("mac")) return "MacOS";
+  if (ua.includes("linux") || pf.includes("linux")) return "Linux";
+  return "Unknown";
+}
+
+function detectBrowser(userAgent: string) {
+  const ua = userAgent.toLowerCase();
+  if (ua.includes("edg/")) return "Edge";
+  if (ua.includes("brave")) return "Brave";
+  if (ua.includes("firefox")) return "Firefox";
+  if (ua.includes("safari") && !ua.includes("chrome")) return "Safari";
+  if (ua.includes("chrome")) return "Chrome";
+  return "Unknown";
+}
+
+function sanitizeDevicePart(value: string) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 24) || "unknown";
+}
+
+function buildDeviceId(osName: string, browserName: string) {
+  const osPart = sanitizeDevicePart(osName);
+  const browserPart = sanitizeDevicePart(browserName);
+  const suffix = Math.random().toString(36).slice(2, 8);
+  return `DEVICE_${osPart}_${browserPart}_${suffix}`;
+}
+
+const emptyHardwareInfo = {
+  laptop_make: "",
+  laptop_model: "",
+  cpu_model: "",
+  ram_gb: "",
+  screen_resolution: "",
+  battery_status: "",
+  wifi_signal_strength: "",
+  audio_device_name: "",
+  audio_driver_version: "",
+  keyboard_layout_locale: "",
+};
+
+const emptyParticipant = {
+  person_no: "",
+  age_range: "",
+  gender: "",
+  dominant_hand: "",
+  years_keyboard_use: "",
+  profession_field: "",
+  keyboard_type: "",
+  room_type: "",
+  voip_type: "",
+};
+
+export default function Home() {
+  const [sessionId, setSessionId] = useState("");
+  const [origin, setOrigin] = useState("");
+  const [deviceInfo, setDeviceInfo] = useState({ os: "", browser: "" });
+  const [deviceId, setDeviceId] = useState("");
+  const [hardwareInfo, setHardwareInfo] = useState(emptyHardwareInfo);
+  const [participant, setParticipant] = useState(emptyParticipant);
+  const [activeTab, setActiveTab] = useState("paragraph");
+  const [socket, setSocket] = useState<Socket | null>(null);
+  const [socketStatus, setSocketStatus] = useState("disconnected");
+  const [socketError, setSocketError] = useState("");
+
+  useEffect(() => {
+    setOrigin(window.location.origin);
+  }, []);
+
+  useEffect(() => {
+    const ua = navigator.userAgent || "";
+    const pf = navigator.platform || "";
+    setDeviceInfo({
+      os: detectOS(ua, pf),
+      browser: detectBrowser(ua),
+    });
+  }, []);
+
+  useEffect(() => {
+    const stored = window.localStorage.getItem("decker_device_id");
+    if (stored) {
+      setDeviceId(stored);
+      return;
+    }
+    if (!deviceInfo.os && !deviceInfo.browser) return;
+    const nextId = buildDeviceId(deviceInfo.os, deviceInfo.browser);
+    window.localStorage.setItem("decker_device_id", nextId);
+    setDeviceId(nextId);
+  }, [deviceInfo]);
+
+  useEffect(() => {
+    const socketUrl =
+      process.env.NEXT_PUBLIC_SOCKET_URL || window.location.origin;
+    const nextSocket = io(socketUrl, {
+      path: "/socket.io",
+    });
+    setSocket(nextSocket);
+
+    const handleConnect = () => {
+      setSocketStatus("connected");
+      setSocketError("");
+      nextSocket.emit("request_session");
+    };
+
+    const handleDisconnect = (reason: string) => {
+      setSocketStatus("disconnected");
+      setSocketError(reason ? `Disconnected: ${reason}` : "");
+    };
+
+    const handleConnectError = (error: unknown) => {
+      setSocketStatus("error");
+      const details =
+        typeof error === "object" && error && "description" in error
+          ? String(error.description)
+          : "";
+      const detail =
+        details || (error instanceof Error ? error.message : "") ||
+        "Socket connection failed";
+      setSocketError(detail);
+    };
+
+    nextSocket.on("connect", handleConnect);
+    nextSocket.on("disconnect", handleDisconnect);
+    nextSocket.on("connect_error", handleConnectError);
+    nextSocket.on("session_created", (payload) => {
+      setSessionId(payload?.sessionId || "");
+    });
+
+    return () => {
+      nextSocket.off("connect", handleConnect);
+      nextSocket.off("disconnect", handleDisconnect);
+      nextSocket.off("connect_error", handleConnectError);
+      nextSocket.disconnect();
+    };
+  }, []);
+
+  const qrUrl = useMemo(() => {
+    if (!sessionId) return "";
+    const base =
+      process.env.NEXT_PUBLIC_BASE_URL || origin || "https://YOUR_DOMAIN";
+    return `${base}/mobile?session=${encodeURIComponent(sessionId)}`;
+  }, [origin, sessionId]);
+
+  const metadata = useMemo(
+    () => ({
+      session_id: sessionId,
+      device_id: deviceId,
+      operating_system: deviceInfo.os,
+      browser_name: deviceInfo.browser,
+      ...hardwareInfo,
+      ...participant,
+    }),
+    [deviceId, deviceInfo, hardwareInfo, participant, sessionId]
+  );
+
+  const handleParticipantChange = (
+    field: keyof typeof emptyParticipant,
+    value: string
+  ) => {
+    setParticipant((prev) => ({
+      ...prev,
+      [field]: value,
+    }));
+  };
+
+  return (
+    <div className="min-h-screen bg-[radial-gradient(circle_at_top,_#fef3c7,_#f5f2ec_55%,_#e7ddd0_100%)] text-slate-900">
+      <main className="mx-auto flex w-full max-w-6xl flex-col gap-8 px-6 py-10 sm:px-10">
+        <section className="flex flex-col gap-6 rounded-3xl border border-[var(--panel-border)] bg-[var(--panel)] p-6 shadow-[0_25px_60px_rgba(15,23,42,0.15)] sm:p-10 fade-in">
+          <div className="flex flex-col gap-6 lg:flex-row lg:items-start lg:justify-between">
+            <div className="flex flex-col gap-4">
+              <p className="text-xs uppercase tracking-[0.3em] text-[var(--accent)]">
+                DECKER+ Dataset Collection
+              </p>
+              <h1 className="text-3xl font-semibold tracking-tight text-[var(--accent-strong)] sm:text-4xl">
+                DECKER+ Dataset Keyboard Recorder
+              </h1>
+              <p className="max-w-2xl text-sm leading-6 text-slate-700">
+                This application records audio snippets around each keystroke
+                while you type a standardized paragraph for research purposes.
+              </p>
+            </div>
+            <div className="flex flex-col items-start gap-4 sm:items-end">
+              <button
+                type="button"
+                onClick={() => window.location.reload()}
+                className="rounded-full border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-800 shadow-sm transition hover:-translate-y-0.5 hover:border-slate-400"
+              >
+                Reload Session
+              </button>
+              <QRCodeDisplay url={qrUrl} />
+            </div>
+          </div>
+        </section>
+
+        <section className="grid gap-6 lg:grid-cols-[1.2fr_1fr] rise-in stagger-1">
+          <div className="rounded-3xl border border-slate-200 bg-white/80 p-6 shadow-[0_20px_40px_rgba(15,23,42,0.12)]">
+            <h2 className="text-lg font-semibold text-slate-900">
+              Device Information
+            </h2>
+            <p className="mt-1 text-sm text-slate-600">
+              Auto-filled from your browser and session handshake.
+            </p>
+            <div className="mt-4 grid gap-4 sm:grid-cols-3">
+              <label className="flex flex-col gap-1 text-xs font-medium uppercase tracking-wide text-slate-500 sm:col-span-3">
+                Session ID
+                <input
+                  readOnly
+                  value={sessionId}
+                  className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-800"
+                />
+              </label>
+              <label className="flex flex-col gap-1 text-xs font-medium uppercase tracking-wide text-slate-500">
+                Operating System
+                <input
+                  readOnly
+                  value={deviceInfo.os}
+                  className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-800"
+                />
+              </label>
+              <label className="flex flex-col gap-1 text-xs font-medium uppercase tracking-wide text-slate-500">
+                Browser
+                <input
+                  readOnly
+                  value={deviceInfo.browser}
+                  className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-800"
+                />
+              </label>
+              <label className="flex flex-col gap-1 text-xs font-medium uppercase tracking-wide text-slate-500">
+                Socket Status
+                <input
+                  readOnly
+                  value={socketStatus}
+                  className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-800"
+                />
+              </label>
+            </div>
+            {socketError ? (
+              <p className="mt-3 text-xs text-rose-600">{socketError}</p>
+            ) : null}
+          </div>
+          <div className="rounded-3xl border border-slate-200 bg-white/80 p-6 shadow-[0_20px_40px_rgba(15,23,42,0.12)]">
+            <h2 className="text-lg font-semibold text-slate-900">
+              Consent Form
+            </h2>
+            <p className="mt-2 text-sm text-slate-700">
+              Kindly click on the below link and confirm your consent for your
+              participation in this research:
+            </p>
+            <a
+              href="https://forms.gle/Tofq7JNUHpWQ5WJp8"
+              target="_blank"
+              rel="noreferrer"
+              className="mt-4 inline-flex items-center gap-2 rounded-full border border-[var(--accent)] px-4 py-2 text-sm font-semibold text-[var(--accent)] transition hover:bg-[var(--accent)] hover:text-white"
+            >
+              Consent Form Link
+            </a>
+          </div>
+        </section>
+
+        <section className="rounded-3xl border border-slate-200 bg-white/90 p-6 shadow-[0_20px_40px_rgba(15,23,42,0.12)] rise-in stagger-2">
+          <h2 className="text-lg font-semibold text-slate-900">
+            System Information
+          </h2>
+          <TerminalScripts
+            hardwareInfo={hardwareInfo}
+            onHardwareInfoChange={setHardwareInfo}
+          />
+        </section>
+
+        <section className="rounded-3xl border border-slate-200 bg-white/90 p-6 shadow-[0_20px_40px_rgba(15,23,42,0.12)]">
+          <h2 className="text-lg font-semibold text-slate-900">
+            Participant Details
+          </h2>
+          <div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            <label className="flex flex-col gap-2 text-xs font-medium uppercase tracking-wide text-slate-500">
+              Person No
+              <select
+                value={participant.person_no}
+                onChange={(event) =>
+                  handleParticipantChange("person_no", event.target.value)
+                }
+                className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"
+              >
+                <option value="">Select</option>
+                {[
+                  "Person 1",
+                  "Person 2",
+                  "Person 3",
+                  "Person 4",
+                  "Person 5",
+                ].map((item) => (
+                  <option key={item} value={item}>
+                    {item}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="flex flex-col gap-2 text-xs font-medium uppercase tracking-wide text-slate-500">
+              Age Range
+              <select
+                value={participant.age_range}
+                onChange={(event) =>
+                  handleParticipantChange("age_range", event.target.value)
+                }
+                className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"
+              >
+                <option value="">Select</option>
+                {[
+                  "18-22",
+                  "23-27",
+                  "28-35",
+                  "36-45",
+                  "45+",
+                ].map((item) => (
+                  <option key={item} value={item}>
+                    {item}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="flex flex-col gap-2 text-xs font-medium uppercase tracking-wide text-slate-500">
+              Gender
+              <select
+                value={participant.gender}
+                onChange={(event) =>
+                  handleParticipantChange("gender", event.target.value)
+                }
+                className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"
+              >
+                <option value="">Select</option>
+                {["Female", "Male", "Non-binary", "Prefer not to say"].map(
+                  (item) => (
+                    <option key={item} value={item}>
+                      {item}
+                    </option>
+                  )
+                )}
+              </select>
+            </label>
+            <label className="flex flex-col gap-2 text-xs font-medium uppercase tracking-wide text-slate-500">
+              Dominant Hand
+              <select
+                value={participant.dominant_hand}
+                onChange={(event) =>
+                  handleParticipantChange("dominant_hand", event.target.value)
+                }
+                className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"
+              >
+                <option value="">Select</option>
+                {["Left", "Right", "Ambidextrous"].map((item) => (
+                  <option key={item} value={item}>
+                    {item}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="flex flex-col gap-2 text-xs font-medium uppercase tracking-wide text-slate-500">
+              Years Keyboard Use
+              <select
+                value={participant.years_keyboard_use}
+                onChange={(event) =>
+                  handleParticipantChange(
+                    "years_keyboard_use",
+                    event.target.value
+                  )
+                }
+                className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"
+              >
+                <option value="">Select</option>
+                {[
+                  "Less than 1 year",
+                  "1 to 3 years",
+                  "3 to 7 years",
+                  "7 to 15 years",
+                  "More than 15 years",
+                ].map((item) => (
+                  <option key={item} value={item}>
+                    {item}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="flex flex-col gap-2 text-xs font-medium uppercase tracking-wide text-slate-500">
+              Profession Field
+              <select
+                value={participant.profession_field}
+                onChange={(event) =>
+                  handleParticipantChange("profession_field", event.target.value)
+                }
+                className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"
+              >
+                <option value="">Select</option>
+                {[
+                  "CS or Engineering",
+                  "Sciences",
+                  "Humanities",
+                  "Management",
+                  "Medical",
+                  "Other",
+                ].map((item) => (
+                  <option key={item} value={item}>
+                    {item}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="flex flex-col gap-2 text-xs font-medium uppercase tracking-wide text-slate-500">
+              Keyboard Type
+              <select
+                value={participant.keyboard_type}
+                onChange={(event) =>
+                  handleParticipantChange("keyboard_type", event.target.value)
+                }
+                className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"
+              >
+                <option value="">Select</option>
+                {[
+                  "built_in_laptop",
+                  "external_mechanical",
+                  "external_membrane",
+                  "Other",
+                ].map((item) => (
+                  <option key={item} value={item}>
+                    {item}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="flex flex-col gap-2 text-xs font-medium uppercase tracking-wide text-slate-500">
+              Room Type
+              <select
+                value={participant.room_type}
+                onChange={(event) =>
+                  handleParticipantChange("room_type", event.target.value)
+                }
+                className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"
+              >
+                <option value="">Select</option>
+                {[
+                  "Home",
+                  "Office",
+                  "Library",
+                  "Café",
+                  "Lab",
+                  "Open hall",
+                  "Other",
+                ].map((item) => (
+                  <option key={item} value={item}>
+                    {item}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="flex flex-col gap-2 text-xs font-medium uppercase tracking-wide text-slate-500">
+              VoIP Type
+              <select
+                value={participant.voip_type}
+                onChange={(event) =>
+                  handleParticipantChange("voip_type", event.target.value)
+                }
+                className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"
+              >
+                <option value="">Select</option>
+                {[
+                  "Zoom",
+                  "Google Meet",
+                  "Microsoft Teams",
+                  "Cisco Webex",
+                  "Zoho Meeting",
+                  "Other",
+                ].map((item) => (
+                  <option key={item} value={item}>
+                    {item}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+        </section>
+
+        <section className="rounded-3xl border border-slate-200 bg-white/95 p-6 shadow-[0_20px_40px_rgba(15,23,42,0.12)]">
+          <div className="flex flex-col gap-4">
+            <div>
+              <h2 className="text-lg font-semibold text-slate-900">
+                📝 Typing Instructions
+              </h2>
+              <ol className="mt-3 grid gap-2 text-sm text-slate-700">
+                <li>Step 1: Click "Start Recording" button below.</li>
+                <li>Step 2: Type the complete "Paragraph to Type" exactly as shown.</li>
+                <li>Step 3: Switch to "Special Key Block" tab and type that text.</li>
+                <li>
+                  Step 4: Click "Stop Recording" when finished with both the tabs.
+                </li>
+              </ol>
+            </div>
+
+            <div className="flex flex-wrap gap-3">
+              {[
+                { key: "paragraph", label: "Paragraph to Type" },
+                { key: "special", label: "Special Key Block" },
+              ].map((tab) => (
+                <button
+                  key={tab.key}
+                  type="button"
+                  onClick={() => setActiveTab(tab.key)}
+                  className={`rounded-full px-4 py-2 text-sm font-semibold transition ${
+                    activeTab === tab.key
+                      ? "bg-[var(--accent)] text-white"
+                      : "bg-slate-100 text-slate-700 hover:bg-slate-200"
+                  }`}
+                >
+                  {tab.label}
+                </button>
+              ))}
+            </div>
+
+            <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm leading-6 text-slate-800">
+              {activeTab === "paragraph" ? (
+                <pre className="whitespace-pre-wrap font-[var(--font-mono)] text-xs sm:text-sm">
+                  {paragraphText}
+                </pre>
+              ) : (
+                <p className="font-[var(--font-mono)] text-xs sm:text-sm">
+                  {specialKeyText}
+                </p>
+              )}
+            </div>
+          </div>
+        </section>
+
+        <TypingConsole
+          sessionId={sessionId}
+          socket={socket}
+          metadata={metadata}
+          deviceId={deviceId}
+        />
+      </main>
+    </div>
+  );
+}
+
+
+========================================
+FILE: src/app/layout.tsx
+========================================
+import type { Metadata } from "next";
+import { IBM_Plex_Mono, Space_Grotesk } from "next/font/google";
+import "./globals.css";
+
+const spaceGrotesk = Space_Grotesk({
+  variable: "--font-space-grotesk",
+  subsets: ["latin"],
+});
+
+const plexMono = IBM_Plex_Mono({
+  variable: "--font-plex-mono",
+  subsets: ["latin"],
+  weight: ["400", "500"],
+});
+
+export const metadata: Metadata = {
+  title: "DECKER+ Dataset Keyboard Recorder",
+  description:
+    "Dataset collection dashboard for synchronized keyboard and audio capture.",
+};
+
+export default function RootLayout({
+  children,
+}: Readonly<{
+  children: React.ReactNode;
+}>) {
+  return (
+    <html
+      lang="en"
+      className={`${spaceGrotesk.variable} ${plexMono.variable} h-full antialiased`}
+    >
+      <body className="min-h-full flex flex-col">{children}</body>
+    </html>
+  );
+}
+
+
+========================================
+FILE: src/lib/googleDriveClient.js
+========================================
+import { google } from "googleapis";
+import fs from "fs";
+import { Readable } from "stream";
+
+export function getDriveClient() {
+  if (
+    !process.env.CLIENT_ID ||
+    !process.env.CLIENT_SECRET ||
+    !process.env.OAUTH_REDIRECT_URI ||
+    !process.env.REFRESH_TOKEN
+  ) {
+    throw new Error(
+      "Missing OAuth env vars: CLIENT_ID, CLIENT_SECRET, OAUTH_REDIRECT_URI, REFRESH_TOKEN"
+    );
+  }
+
+  const oauth2Client = new google.auth.OAuth2(
+    process.env.CLIENT_ID,
+    process.env.CLIENT_SECRET,
+    process.env.OAUTH_REDIRECT_URI
+  );
+
+  oauth2Client.setCredentials({
+    refresh_token: process.env.REFRESH_TOKEN,
+  });
+
+  return google.drive({ version: "v3", auth: oauth2Client });
+}
+
+export async function ensureFolder(drive, parentId, folderName) {
+  const query = `name='${folderName}' and '${parentId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`;
+  const res = await drive.files.list({
+    q: query,
+    fields: "files(id, name)",
+    spaces: "drive",
+  });
+
+  if (res.data.files && res.data.files.length > 0) {
+    return res.data.files[0].id;
+  }
+
+  const folder = await drive.files.create({
+    requestBody: {
+      name: folderName,
+      mimeType: "application/vnd.google-apps.folder",
+      parents: [parentId],
+    },
+    fields: "id, name",
+  });
+
+  return folder.data.id;
+}
+
+export async function uploadFileFromPath(drive, folderId, filePath, fileName, mimeType) {
+  const res = await drive.files.create({
+    requestBody: {
+      name: fileName,
+      parents: folderId ? [folderId] : undefined,
+    },
+    media: {
+      mimeType,
+      body: fs.createReadStream(filePath),
+    },
+    fields: "id, name",
+  });
+
+  return res.data.id;
+}
+
+export async function findFileId(drive, parentId, fileName) {
+  const query = `name='${fileName}' and '${parentId}' in parents and trashed=false`;
+  const res = await drive.files.list({
+    q: query,
+    fields: "files(id, name)",
+    spaces: "drive",
+  });
+
+  if (res.data.files && res.data.files.length > 0) {
+    return res.data.files[0].id;
+  }
+
+  return null;
+}
+
+export async function downloadFileText(drive, fileId) {
+  const res = await drive.files.get(
+    { fileId, alt: "media" },
+    { responseType: "arraybuffer" }
+  );
+
+  return Buffer.from(res.data).toString("utf8");
+}
+
+export async function upsertTextFile(drive, parentId, fileName, content) {
+  const fileId = await findFileId(drive, parentId, fileName);
+  const media = {
+    mimeType: "text/csv",
+    body: Readable.from([content]),
+  };
+
+  if (fileId) {
+    const res = await drive.files.update({
+      fileId,
+      media,
+      fields: "id, name",
+    });
+    return res.data.id;
+  }
+
+  const res = await drive.files.create({
+    requestBody: {
+      name: fileName,
+      parents: parentId ? [parentId] : undefined,
+    },
+    media,
+    fields: "id, name",
+  });
+
+  return res.data.id;
+}
+
+
+========================================
+FILE: src/components/QRCodeDisplay.js
+========================================
+"use client";
+
+import { useMemo } from "react";
+
+export default function QRCodeDisplay({ url }) {
+	const qrSrc = useMemo(() => {
+		if (!url) return "";
+		return `https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(
+			url
+		)}`;
+	}, [url]);
+
+	return (
+		<div className="flex w-full flex-col items-center gap-2 rounded-2xl border border-slate-200 bg-white/90 p-4 text-center shadow-sm">
+			<p className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-500">
+				Mobile Pairing
+			</p>
+			<div className="flex h-40 w-40 items-center justify-center rounded-2xl border border-dashed border-slate-300 bg-slate-50">
+				{qrSrc ? (
+					<img
+						src={qrSrc}
+						alt="QR code linking to the mobile session"
+						className="h-36 w-36"
+						loading="lazy"
+					/>
+				) : (
+					<span className="text-xs text-slate-400">Waiting for session...</span>
+				)}
+			</div>
+			<p className="max-w-[220px] break-words text-[11px] text-slate-500">
+				{url || "Session link will appear here."}
+			</p>
+		</div>
+	);
+}
+
+
+========================================
+FILE: src/components/TypingConsole.js
+========================================
+"use client";
+
+import { useEffect, useMemo, useRef, useState } from "react";
+
+function buildCsv(metadata, keystrokes) {
+	const metadataRows = Object.entries(metadata).map(([key, value]) =>
+		`${key},${String(value ?? "").replace(/\n/g, " ")}`
+	);
+
+	const keystrokeRows = keystrokes.map(
+		(entry) =>
+			`${entry.action},${entry.key.replace(/\n/g, " ")},${entry.timestamp_ms}`
+	);
+
+	return [
+		"metadata_key,metadata_value",
+		...metadataRows,
+		"",
+		"action,key,timestamp_ms",
+		...keystrokeRows,
+	].join("\n");
+}
+
+export default function TypingConsole({ sessionId, socket, metadata, deviceId }) {
+	const [status, setStatus] = useState("idle");
+	const [typedText, setTypedText] = useState("");
+	const [micError, setMicError] = useState("");
+	const [lastUpload, setLastUpload] = useState("");
+	const isSocketReady = Boolean(socket && socket.connected);
+
+	const streamRef = useRef(null);
+	const mediaRecorderRef = useRef(null);
+	const chunksRef = useRef([]);
+	const keystrokesRef = useRef([]);
+	const beepTimeRef = useRef(null);
+	const beepTimeoutRef = useRef(null);
+	const recordingRef = useRef(false);
+
+	useEffect(() => {
+		let cancelled = false;
+
+		if (!navigator?.mediaDevices?.getUserMedia) {
+			setMicError("Microphone API unavailable. Use HTTPS or a supported browser.");
+			return () => {
+				cancelled = true;
+			};
+		}
+
+		navigator.mediaDevices
+			.getUserMedia({
+				audio: {
+					echoCancellation: false,
+					noiseSuppression: false,
+					autoGainControl: false,
+				},
+			})
+			.then((stream) => {
+				if (cancelled) return;
+				streamRef.current = stream;
+				const recorder = new MediaRecorder(stream);
+				recorder.ondataavailable = (event) => {
+					if (event.data && event.data.size > 0) {
+						chunksRef.current.push(event.data);
+					}
+				};
+				mediaRecorderRef.current = recorder;
+			})
+			.catch((error) => {
+				console.error("Microphone error", error);
+				setMicError("Microphone access is required for recording.");
+			});
+
+		return () => {
+			cancelled = true;
+			if (beepTimeoutRef.current) {
+				clearTimeout(beepTimeoutRef.current);
+			}
+			streamRef.current?.getTracks().forEach((track) => track.stop());
+		};
+	}, []);
+
+	useEffect(() => {
+		if (!socket) return undefined;
+
+		const handleTrigger = () => {
+			startRecording();
+		};
+		const handleStop = () => {
+			stopRecording(true);
+		};
+
+		socket.on("trigger_recording", handleTrigger);
+		socket.on("stop_recording", handleStop);
+
+		return () => {
+			socket.off("trigger_recording", handleTrigger);
+			socket.off("stop_recording", handleStop);
+		};
+	}, [socket]);
+
+	const statusLabel = useMemo(() => {
+		if (status === "recording") return "Recording in progress";
+		return "Microphone idle";
+	}, [status]);
+
+	const playBeep = () => {
+		const AudioContext = window.AudioContext || window.webkitAudioContext;
+		if (!AudioContext) return;
+
+		const audioContext = new AudioContext();
+		const oscillator = audioContext.createOscillator();
+		const gain = audioContext.createGain();
+
+		oscillator.type = "sine";
+		oscillator.frequency.setValueAtTime(3000, audioContext.currentTime);
+		gain.gain.setValueAtTime(0.15, audioContext.currentTime);
+
+		oscillator.connect(gain);
+		gain.connect(audioContext.destination);
+		oscillator.start();
+		beepTimeRef.current = performance.now();
+
+		setTimeout(() => {
+			oscillator.stop();
+			audioContext.close();
+		}, 50);
+	};
+
+	const startRecording = () => {
+		if (!sessionId) return;
+		if (recordingRef.current) return;
+		if (mediaRecorderRef.current?.state === "recording") return;
+		if (!mediaRecorderRef.current) {
+			setMicError("Microphone is not ready yet.");
+			return;
+		}
+
+		chunksRef.current = [];
+		keystrokesRef.current = [];
+		beepTimeRef.current = null;
+		mediaRecorderRef.current.start(1000);
+		setStatus("recording");
+		recordingRef.current = true;
+		setLastUpload("");
+
+		if (beepTimeoutRef.current) {
+			clearTimeout(beepTimeoutRef.current);
+		}
+		beepTimeoutRef.current = setTimeout(() => {
+			playBeep();
+		}, 1000);
+	};
+
+	const stopRecording = async (remoteStop = false) => {
+		if (status !== "recording") return;
+		recordingRef.current = false;
+		if (beepTimeoutRef.current) {
+			clearTimeout(beepTimeoutRef.current);
+		}
+
+		if (!remoteStop) {
+			socket?.emit("stop_recording_command", { sessionId });
+		}
+
+		if (mediaRecorderRef.current?.state === "recording") {
+			await new Promise((resolve) => {
+				mediaRecorderRef.current.onstop = resolve;
+				mediaRecorderRef.current.stop();
+			});
+		}
+
+		const audioBlob = new Blob(chunksRef.current, {
+			type: "audio/webm",
+		});
+
+		const csv = buildCsv(metadata, keystrokesRef.current);
+		const formData = new FormData();
+		formData.append("sessionId", sessionId);
+		formData.append("device", "laptop");
+		formData.append("device_id", deviceId || "unknown-device");
+		formData.append(
+			"metadata_csv",
+			new Blob([csv], { type: "text/csv" }),
+			`metadata_${sessionId}.csv`
+		);
+		formData.append(
+			"audio",
+			audioBlob,
+			`laptop_audio_${sessionId}.webm`
+		);
+
+		try {
+			const apiBase =
+				process.env.NEXT_PUBLIC_SOCKET_URL || window.location.origin;
+			const response = await fetch(`${apiBase}/api/upload`, {
+				method: "POST",
+				body: formData,
+			});
+
+			if (!response.ok) {
+				throw new Error("Upload failed");
+			}
+			setLastUpload("Laptop upload completed.");
+		} catch (error) {
+			console.error("Upload error", error);
+			setLastUpload("Upload failed. Please try again.");
+		}
+
+		setStatus("idle");
+	};
+
+	const handleKeyEvent = (event, action) => {
+		if (status !== "recording") return;
+		if (event.repeat) return;
+		if (!beepTimeRef.current) return;
+
+		const timestamp = performance.now() - beepTimeRef.current;
+		keystrokesRef.current.push({
+			action,
+			key: event.key,
+			timestamp_ms: Math.round(timestamp),
+		});
+	};
+
+	return (
+		<section className="rounded-3xl border border-slate-200 bg-white/95 p-6 shadow-[0_20px_40px_rgba(15,23,42,0.12)]">
+			<div className="flex flex-col gap-4">
+				<div>
+					<h2 className="text-lg font-semibold text-slate-900">TYPING BOX</h2>
+					<p className="mt-1 text-sm text-slate-600">
+						Click inside and start typing after you hear a beep after you have
+						clicked "Start Recording".
+					</p>
+				</div>
+
+				<div className="flex flex-wrap gap-3">
+					<button
+						type="button"
+						onClick={() => {
+							startRecording();
+							socket?.emit("start_recording_command", { sessionId });
+						}}
+						disabled={!sessionId || !isSocketReady}
+						className="rounded-full bg-[var(--accent)] px-5 py-2 text-sm font-semibold text-white transition hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-50"
+					>
+						Start Recording
+					</button>
+					<button
+						type="button"
+						onClick={() => stopRecording(false)}
+						disabled={!sessionId || !isSocketReady}
+						className="rounded-full border border-slate-200 bg-white px-5 py-2 text-sm font-semibold text-slate-700 transition hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-50"
+					>
+						Stop Recording
+					</button>
+					<button
+						type="button"
+						onClick={() => {
+							setTypedText("");
+							if (status !== "recording") {
+								keystrokesRef.current = [];
+							}
+						}}
+						className="rounded-full border border-slate-200 bg-white px-5 py-2 text-sm font-semibold text-slate-700 transition hover:-translate-y-0.5"
+					>
+						Clear Box
+					</button>
+				</div>
+
+				<div className="flex items-center gap-3 text-xs text-slate-600">
+					<span
+						className={`h-3 w-3 rounded-full ${
+							status === "recording"
+								? "bg-emerald-500 shadow-[0_0_12px_rgba(16,185,129,0.7)] animate-pulse"
+								: "bg-slate-300"
+						}`}
+					/>
+					<span>{statusLabel}</span>
+					<span>
+						{isSocketReady ? "Socket connected" : "Socket not connected"}
+					</span>
+					{micError ? <span className="text-rose-600">{micError}</span> : null}
+					{lastUpload ? <span className="text-emerald-700">{lastUpload}</span> : null}
+				</div>
+
+				<textarea
+					rows={8}
+					value={typedText}
+					onChange={(event) => setTypedText(event.target.value)}
+					onKeyDown={(event) => handleKeyEvent(event, "down")}
+					onKeyUp={(event) => handleKeyEvent(event, "up")}
+					className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-4 text-sm text-slate-800"
+					placeholder="Start typing here..."
+				/>
+
+				<p className="text-xs uppercase tracking-[0.2em] text-slate-400">
+					For Research Purposes Only. Thank You For Your Participation.
+				</p>
+			</div>
+		</section>
+	);
+}
+
+
+========================================
+FILE: src/components/TerminalScripts.js
+========================================
+"use client";
+
+import { useMemo, useState } from "react";
+
+const windowsScript = [
+	"$ErrorActionPreference = 'SilentlyContinue'",
+	"$cs = Get-CimInstance Win32_ComputerSystem",
+	"$make = $cs.Manufacturer",
+	"$model = $cs.Model",
+	"$cpu = (Get-CimInstance Win32_Processor | Select-Object -First 1).Name",
+	"$ram = [math]::Round($cs.TotalPhysicalMemory / 1GB)",
+	"$vid = Get-CimInstance Win32_VideoController | Select-Object -First 1",
+	"$screen = if ($vid) { \"$($vid.CurrentHorizontalResolution)x$($vid.CurrentVerticalResolution)\" } else { \"Unknown\" }",
+	"$batt = Get-CimInstance Win32_Battery | Select-Object -First 1",
+	"$batteryStatus = if ($batt) { switch ($batt.BatteryStatus) { 2 {\"AC Power\"}; 1 {\"On Battery\"}; default {\"Charging\"} } } else { \"AC Power / No Battery\" }",
+	"$wifi = (netsh wlan show interfaces | Select-String \"Signal\" | ForEach-Object { $_.Line.Split(\":\")[1].Trim() })",
+	"if ([string]::IsNullOrWhiteSpace($wifi)) { $wifi = \"Not Connected\" }",
+	"$audioDev = Get-CimInstance Win32_SoundDevice | Select-Object -First 1",
+	"$audioName = if ($audioDev) { $audioDev.Name } else { \"Unknown\" }",
+	"$audioDriver = if ($audioDev) { (Get-CimInstance Win32_PnPSignedDriver | Where-Object { $_.DeviceName -eq $audioName } | Select-Object -First 1).DriverVersion } else { \"Unknown\" }",
+	"if ([string]::IsNullOrWhiteSpace($audioDriver)) { $audioDriver = \"Standard/Unknown\" }",
+	"$locale = (Get-WinUserLanguageList)[0].LanguageTag",
+	"Write-Host \"`n`n`n`n<----------------OUTPUTS-------------------->`n`n\"",
+	"Write-Host \"Make:                  $make\"",
+	"Write-Host \"Model Name:            $model\"",
+	"Write-Host \"CPU Model:             $cpu\"",
+	"Write-Host \"RAM (GB):              $ram\"",
+	"Write-Host \"Screen Resolution:     $screen\"",
+	"Write-Host \"Battery Status:        $batteryStatus\"",
+	"Write-Host \"Wi-Fi Signal Strength: $wifi\"",
+	"Write-Host \"Audio Device:          $audioName\"",
+	"Write-Host \"Audio Driver Version:  $audioDriver\"",
+	"Write-Host \"Keyboard Locale:       $locale\"",
+	"Write-Host \"`n`n>>>Kindly copy the above output and paste it into the text box in the website\"",
+].join("\n");
+
+const linuxScript = [
+	"#!/bin/bash",
+	"make=$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null || echo \"Unknown\")",
+	"model=$(cat /sys/class/dmi/id/product_name 2>/dev/null || echo \"Unknown\")",
+	"cpu=$(grep -m 1 'model name' /proc/cpuinfo | cut -d: -f2 | sed 's/^ *//')",
+	"ram=$(awk '/MemTotal/ {printf \"%.0f\", $2/1024/1024}' /proc/meminfo)",
+	"screen=$(xrandr 2>/dev/null | awk '/\\*/ {print $1; exit}')",
+	"[ -z \"$screen\" ] && screen=\"Unknown (Wayland/Headless)\"",
+	"batteryStatus=$(cat /sys/class/power_supply/BAT*/status 2>/dev/null | head -n 1)",
+	"[ -z \"$batteryStatus\" ] && batteryStatus=\"AC Power / No Battery\"",
+	"wifi=$(nmcli -t -f IN-USE,SIGNAL dev wifi 2>/dev/null | grep '^\\*' | cut -d: -f2 | sed 's/$/%/')",
+	"[ -z \"$wifi\" ] && wifi=\"Not Connected\"",
+	"audioName=$(lspci 2>/dev/null | grep -i audio | head -n 1 | cut -d: -f3 | sed 's/^ *//')",
+	"[ -z \"$audioName\" ] && audioName=\"Unknown\"",
+	"audioDriver=$(lspci -k 2>/dev/null | grep -iA 2 audio | grep 'Kernel modules' | head -n 1 | cut -d: -f2 | sed 's/^ *//')",
+	"[ -z \"$audioDriver\" ] && audioDriver=\"Standard/Unknown\"",
+	"locale=$(localectl status 2>/dev/null | grep \"X11 Layout\" | cut -d: -f2 | sed 's/^ *//')",
+	"[ -z \"$locale\" ] && locale=$LANG",
+	"echo -e \"\\n\\n\\n\\n<----------------OUTPUTS-------------------->\\n\\n\"",
+	"echo \"Make:                  $make\"",
+	"echo \"Model Name:            $model\"",
+	"echo \"CPU Model:             $cpu\"",
+	"echo \"RAM (GB):              $ram\"",
+	"echo \"Screen Resolution:     $screen\"",
+	"echo \"Battery Status:        $batteryStatus\"",
+	"echo \"Wi-Fi Signal Strength: $wifi\"",
+	"echo \"Audio Device:          $audioName\"",
+	"echo \"Audio Driver Version:  $audioDriver\"",
+	"echo \"Keyboard Locale:       $locale\"",
+	"echo -e \"\\n\\n>>>Kindly copy the above output and paste it into the text box in the website\"",
+].join("\n");
+
+const macScript = [
+	"make=\"Apple\"",
+	"model=$(sysctl -n hw.model)",
+	"cpu=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo \"Apple Silicon\")",
+	"ram=$(( $(sysctl -n hw.memsize) / 1073741824 ))",
+	"screen=$(system_profiler SPDisplaysDataType 2>/dev/null | awk '/Resolution:/ {print $2, $3, $4; exit}')",
+	"[ -z \"$screen\" ] && screen=\"Unknown\"",
+	"batteryStatus=$(pmset -g batt | awk 'NR==2 {print $4}' | tr -d ';')",
+	"[ -z \"$batteryStatus\" ] && batteryStatus=\"AC Power / Desktop\"",
+	"wifi_dbm=$(/System/Library/PrivateFrameworks/Apple80211.framework/Resources/airport -I 2>/dev/null | awk -F': ' '/agrCtlRSSI/ {print $2}')",
+	"if [ -n \"$wifi_dbm\" ]; then wifi=\"${wifi_dbm} dBm\"; else wifi=\"Not Connected\"; fi",
+	"audioName=$(system_profiler SPAudioDataType 2>/dev/null | awk '/Devices:/{getline; print}' | sed 's/^[ \t]*//' | cut -d: -f1)",
+	"[ -z \"$audioName\" ] && audioName=\"Apple Audio Device\"",
+	"audioDriver=\"CoreAudio (Native)\"",
+	"locale=$(defaults read ~/Library/Preferences/com.apple.HIToolbox.plist AppleSelectedInputSources 2>/dev/null | awk -F'\"' '/KeyboardLayout Name/ {print $4}')",
+	"[ -z \"$locale\" ] && locale=\"Unknown\"",
+	"echo -e \"\\n\\n\\n\\n<----------------OUTPUTS-------------------->\\n\\n\"",
+	"echo \"Make:                  $make\"",
+	"echo \"Model Name:            $model\"",
+	"echo \"CPU Model:             $cpu\"",
+	"echo \"RAM (GB):              $ram\"",
+	"echo \"Screen Resolution:     $screen\"",
+	"echo \"Battery Status:        $batteryStatus\"",
+	"echo \"Wi-Fi Signal Strength: $wifi\"",
+	"echo \"Audio Device:          $audioName\"",
+	"echo \"Audio Driver Version:  $audioDriver\"",
+	"echo \"Keyboard Locale:       $locale\"",
+	"echo -e \"\\n\\n>>>Kindly copy the above output and paste it into the text box in the website\"",
+].join("\n");
+
+const fieldConfig = [
+	{ key: "laptop_make", label: "Laptop Make" },
+	{ key: "laptop_model", label: "Laptop Model" },
+	{ key: "cpu_model", label: "CPU Model" },
+	{ key: "ram_gb", label: "RAM (GB)" },
+	{ key: "screen_resolution", label: "Screen Resolution" },
+	{ key: "battery_status", label: "Battery Status" },
+	{ key: "wifi_signal_strength", label: "Wi-Fi Signal Strength" },
+	{ key: "audio_device_name", label: "Audio Device" },
+	{ key: "audio_driver_version", label: "Audio Driver Version" },
+	{ key: "keyboard_layout_locale", label: "Keyboard Locale" },
+];
+
+const parsePatterns = {
+	laptop_make: /Make:\s+(.*)/i,
+	laptop_model: /Model Name:\s+(.*)/i,
+	cpu_model: /CPU Model:\s+(.*)/i,
+	ram_gb: /RAM \(GB\):\s+(.*)/i,
+	screen_resolution: /Screen Resolution:\s+(.*)/i,
+	battery_status: /Battery Status:\s+(.*)/i,
+	wifi_signal_strength: /Wi-?Fi Signal Strength:\s+(.*)/i,
+	audio_device_name: /Audio Device:\s+(.*)/i,
+	audio_driver_version: /Audio Driver Version:\s+(.*)/i,
+	keyboard_layout_locale: /Keyboard Locale:\s+(.*)/i,
+};
+
+const fallbackCopy = (text) => {
+	const textarea = document.createElement("textarea");
+	textarea.value = text;
+	textarea.setAttribute("readonly", "");
+	textarea.style.position = "absolute";
+	textarea.style.left = "-9999px";
+	document.body.appendChild(textarea);
+	textarea.select();
+	const ok = document.execCommand("copy");
+	document.body.removeChild(textarea);
+	return ok;
+};
+
+export default function TerminalScripts({
+	hardwareInfo,
+	onHardwareInfoChange,
+}) {
+	const [rawOutput, setRawOutput] = useState("");
+	const [copied, setCopied] = useState("");
+
+	const scripts = useMemo(
+		() => [
+			{ label: "Windows", value: windowsScript },
+			{ label: "Linux", value: linuxScript },
+			{ label: "Mac", value: macScript },
+		],
+		[]
+	);
+
+	const handleCopy = async (label, script) => {
+		try {
+			if (navigator.clipboard?.writeText) {
+				await navigator.clipboard.writeText(script);
+			} else {
+				const ok = fallbackCopy(script);
+				if (!ok) {
+					throw new Error("Clipboard fallback failed");
+				}
+			}
+			setCopied(label);
+			setTimeout(() => setCopied(""), 2000);
+		} catch (error) {
+			console.error("Clipboard copy failed", error);
+		}
+	};
+
+	const parseOutput = (text) => {
+		const nextInfo = { ...hardwareInfo };
+		Object.entries(parsePatterns).forEach(([key, pattern]) => {
+			const match = text.match(pattern);
+			if (match && match[1]) {
+				nextInfo[key] = match[1].trim();
+			}
+		});
+		onHardwareInfoChange(nextInfo);
+	};
+
+	const handleOutputChange = (event) => {
+		const text = event.target.value;
+		setRawOutput(text);
+		parseOutput(text);
+	};
+
+	return (
+		<div className="mt-4 flex flex-col gap-5 text-sm text-slate-700">
+			<div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-4">
+				<p className="font-medium text-slate-800">Instructions:</p>
+				<ol className="mt-2 grid gap-1 text-sm text-slate-700">
+					<li>
+						1. Click on the button which corresponds to your Operating System.
+						It will copy the terminal script to your clipboard.
+					</li>
+					<li>
+						2. Open your bash/zsh terminal (Linux/macOS) or PowerShell in
+						administrator mode (Windows).
+					</li>
+					<li>
+						3. Copy the output of the script and paste it in the text box below.
+					</li>
+				</ol>
+			</div>
+
+			<div className="flex flex-wrap gap-3">
+				{scripts.map((item) => (
+					<button
+						key={item.label}
+						type="button"
+						onClick={() => handleCopy(item.label, item.value)}
+						className="rounded-full border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-800 transition hover:-translate-y-0.5 hover:border-slate-300"
+					>
+						{item.label}
+						{copied === item.label ? " ✓ Copied" : ""}
+					</button>
+				))}
+			</div>
+
+			<textarea
+				rows={6}
+				value={rawOutput}
+				onChange={handleOutputChange}
+				placeholder="Paste the terminal output here..."
+				className="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-800"
+			/>
+
+			<div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+				{fieldConfig.map((field) => (
+					<label
+						key={field.key}
+						className="flex flex-col gap-1 text-xs font-medium uppercase tracking-wide text-slate-500"
+					>
+						{field.label}
+						<input
+							value={hardwareInfo[field.key] || ""}
+							onChange={(event) =>
+								onHardwareInfoChange({
+									...hardwareInfo,
+									[field.key]: event.target.value,
+								})
+							}
+							className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-800"
+						/>
+					</label>
+				))}
+			</div>
+		</div>
+	);
+}
+
+
+========================================
+FILE: server.js
+========================================
+const http = require("http");
+const next = require("next");
+const { Server } = require("socket.io");
+const fs = require("fs/promises");
+const os = require("os");
+const path = require("path");
+
+const dev = process.env.NODE_ENV !== "production";
+const port = parseInt(process.env.PORT || "3000", 10);
+const app = next({ dev });
+const handle = app.getRequestHandler();
+
+app.prepare().then(() => {
+  const uploadRoot = path.join(os.tmpdir(), "decker_sessions");
+  const counterFile = path.join(uploadRoot, "session_counter.json");
+  const cleanupThresholdMs = 60 * 60 * 1000;
+
+  let sessionCounter = 0;
+  let counterReady = false;
+  let counterLock = Promise.resolve();
+
+  const loadCounter = async () => {
+    try {
+      await fs.mkdir(uploadRoot, { recursive: true });
+      const raw = await fs.readFile(counterFile, "utf8");
+      const data = JSON.parse(raw);
+      sessionCounter = Number(data?.lastId || 0);
+    } catch (error) {
+      sessionCounter = 0;
+      await fs.writeFile(
+        counterFile,
+        JSON.stringify({ lastId: sessionCounter }, null, 2)
+      );
+    }
+    counterReady = true;
+  };
+
+  const persistCounter = async () => {
+    await fs.writeFile(
+      counterFile,
+      JSON.stringify({ lastId: sessionCounter }, null, 2)
+    );
+  };
+
+  const nextSessionId = async () => {
+    counterLock = counterLock.then(async () => {
+      if (!counterReady) {
+        await loadCounter();
+      }
+      sessionCounter += 1;
+      await persistCounter();
+    });
+//DECKER_SESS_YYYYMMDD_HHMMSS_<counter>_<RAND> new format of session id. 
+    await counterLock;
+    const now = new Date();
+    const stamp = `${now.getFullYear()}${String(
+      now.getMonth() + 1
+    ).padStart(2, "0")}${String(now.getDate()).padStart(2, "0")}_${String(
+      now.getHours()
+    ).padStart(2, "0")}${String(now.getMinutes()).padStart(2, "0")}${String(
+      now.getSeconds()
+    ).padStart(2, "0")}`;
+    const counter = String(sessionCounter).padStart(4, "0");
+    const randomSuffix = Math.random().toString(36).slice(2, 6).toUpperCase();
+    return `DECKER_SESS_${stamp}_${counter}_${randomSuffix}`;
+  };
+
+  const cleanupOldFiles = async () => {
+    try {
+      await fs.mkdir(uploadRoot, { recursive: true });
+      const entries = await fs.readdir(uploadRoot, { withFileTypes: true });
+      const now = Date.now();
+
+      await Promise.all(
+        entries.map(async (entry) => {
+          if (!entry.isDirectory()) return;
+          const sessionPath = path.join(uploadRoot, entry.name);
+          const files = await fs.readdir(sessionPath);
+          const stats = await Promise.all(
+            files.map(async (file) => {
+              const filePath = path.join(sessionPath, file);
+              const stat = await fs.stat(filePath);
+              return { filePath, stat };
+            })
+          );
+
+          await Promise.all(
+            stats
+              .filter(({ stat }) => now - stat.mtimeMs > cleanupThresholdMs)
+              .map(({ filePath }) => fs.unlink(filePath))
+          );
+
+          const remaining = await fs.readdir(sessionPath);
+          if (remaining.length === 0) {
+            await fs.rmdir(sessionPath);
+          }
+        })
+      );
+    } catch (error) {
+      console.warn("Cleanup error", error);
+    }
+  };
+
+  cleanupOldFiles();
+  setInterval(cleanupOldFiles, cleanupThresholdMs);
+
+  const httpServer = http.createServer((req, res) => {
+    handle(req, res);
+  });
+
+  const io = new Server(httpServer, {
+    path: "/socket.io",
+    cors: {
+      origin: "*",
+      methods: ["GET", "POST"],
+    },
+  });
+
+  io.on("connection", (socket) => {
+    console.log("Socket connected:", socket.id);
+
+    socket.on("request_session", async () => {
+      const sessionId = await nextSessionId();
+      const room = `room:${sessionId}`;
+
+      socket.join(room);
+      console.log("Session created:", sessionId, "socket:", socket.id);
+      socket.emit("session_created", { sessionId });
+    });
+
+    socket.on("join_room", (payload) => {
+      const sessionId = payload?.sessionId;
+      if (!sessionId) {
+        socket.emit("error", { message: "Missing sessionId" });
+        return;
+      }
+
+      const room = `room:${sessionId}`;
+      socket.join(room);
+      const size = io.sockets.adapter.rooms.get(room)?.size || 0;
+      console.log("Join room:", room, "socket:", socket.id, "size:", size);
+      io.to(room).emit("devices_paired", { sessionId });
+    });
+
+    socket.on("start_recording_command", (payload) => {
+      const sessionId = payload?.sessionId;
+      if (!sessionId) {
+        socket.emit("error", { message: "Missing sessionId" });
+        return;
+      }
+
+      const room = `room:${sessionId}`;
+      const size = io.sockets.adapter.rooms.get(room)?.size || 0;
+      console.log("Start recording:", room, "socket:", socket.id, "size:", size);
+      io.to(room).emit("trigger_recording", { sessionId });
+    });
+
+    socket.on("stop_recording_command", (payload) => {
+      const sessionId = payload?.sessionId;
+      if (!sessionId) {
+        socket.emit("error", { message: "Missing sessionId" });
+        return;
+      }
+
+      const room = `room:${sessionId}`;
+      const size = io.sockets.adapter.rooms.get(room)?.size || 0;
+      console.log("Stop recording:", room, "socket:", socket.id, "size:", size);
+      io.to(room).emit("stop_recording", { sessionId });
+    });
+
+    socket.on("stop_recording_ack", (payload) => {
+      const sessionId = payload?.sessionId;
+      console.log(
+        "Stop ack:",
+        sessionId || "unknown",
+        "socket:",
+        socket.id
+      );
+    });
+
+    socket.on("disconnect", () => {
+      console.log("Socket disconnected:", socket.id);
+    });
+  });
+
+  httpServer.listen(port, () => {
+    console.log(`> Ready on http://localhost:${port}`);
+  });
+});
+
+
+========================================
+FILE: package.json
+========================================
+{
+  "name": "decker-dataset",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "node server.js",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint"
+  },
+  "dependencies": {
+    "googleapis": "^172.0.0",
+    "next": "16.2.6",
+    "react": "19.2.4",
+    "react-dom": "19.2.4",
+    "socket.io": "^4.8.3",
+    "socket.io-client": "^4.8.3"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "16.2.6",
+    "tailwindcss": "^4",
+    "typescript": "^5"
+  }
+}
+
+
+========================================
+FILE: requirements.txt
+========================================
+audioop-lts==0.2.2
+audioread==3.1.0
+certifi==2026.5.20
+cffi==2.0.0
+charset-normalizer==3.4.7
+decorator==5.3.1
+ffmpeg-python==0.2.0
+future==1.0.0
+idna==3.16
+joblib==1.5.3
+lazy-loader==0.5
+librosa==0.11.0
+llvmlite==0.47.0
+msgpack==1.1.2
+numba==0.65.1
+numpy==2.4.6
+packaging==26.2
+platformdirs==4.9.6
+pooch==1.9.0
+pycparser==3.0
+requests==2.34.2
+scikit-learn==1.8.0
+scipy==1.17.1
+soundfile==0.13.1
+soxr==1.1.0
+standard-aifc==3.13.0
+standard-chunk==3.13.0
+standard-sunau==3.13.0
+threadpoolctl==3.6.0
+typing_extensions==4.15.0
+urllib3==2.7.0
+
+

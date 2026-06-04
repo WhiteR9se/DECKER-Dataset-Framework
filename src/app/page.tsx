@@ -7,17 +7,6 @@ import QRCodeDisplay from "../components/QRCodeDisplay";
 import TerminalScripts from "../components/TerminalScripts";
 import TypingConsole from "../components/TypingConsole";
 
-const paragraphText = `The quick brown fox jumps over the lazy dog while amazing zebras quietly vex jumpy kids, proving every letter is present. Pack my box with five dozen liquor jugs to verify the alphabet twice.
-Digits appear forward and backward: 1234567890 then 0987654321, followed by sequences like 2468, 13579, and 314159.
-Now we add punctuation: . , ; : ? ! ' " - _ ( ) [ ] { } /
-
-Symbols and operators: @ # $ % ^ & * + = < > | ~
-To include uppercase properly, acronyms like NASA, USA, UN, AI, ML, and HTML are written in full caps.
-Typing speed and accuracy will be measured across every key, ensuring consistency of captured events.
-Finally, we conclude with a mix: The year is 2025; version v1.0-beta includes features [alpha], {bravo}, and (charlie), all typed carefully for complete coverage of the QWERTY keyboard.`;
-
-const specialKeyText = `1) Tab  2) Backspace  3) Delete  4) Arrow Up  5) Arrow Down  6) Arrow Left  7) Arrow Right  8) Esc  9) F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12  10) Caps Lock (press once to enable, once to disable)  11) Enter (to confirm completion)`;
-
 function detectOS(userAgent: string, platform: string) {
   const ua = userAgent.toLowerCase();
   const pf = platform.toLowerCase();
@@ -42,7 +31,8 @@ function sanitizeDevicePart(value: string) {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
-    .slice(0, 24) || "unknown";
+    .slice(0, 24) ||
+    "unknown";
 }
 
 function buildDeviceId(osName: string, browserName: string) {
@@ -84,7 +74,6 @@ export default function Home() {
   const [deviceId, setDeviceId] = useState("");
   const [hardwareInfo, setHardwareInfo] = useState(emptyHardwareInfo);
   const [participant, setParticipant] = useState(emptyParticipant);
-  const [activeTab, setActiveTab] = useState("paragraph");
   const [socket, setSocket] = useState<Socket | null>(null);
   const [socketStatus, setSocketStatus] = useState("disconnected");
   const [socketError, setSocketError] = useState("");
@@ -512,45 +501,10 @@ export default function Home() {
                 📝 Typing Instructions
               </h2>
               <ol className="mt-3 grid gap-2 text-sm text-slate-700">
-                <li>Step 1: Click "Start Recording" button below.</li>
-                <li>Step 2: Type the complete "Paragraph to Type" exactly as shown.</li>
-                <li>Step 3: Switch to "Special Key Block" tab and type that text.</li>
-                <li>
-                  Step 4: Click "Stop Recording" when finished with both the tabs.
-                </li>
+                <li>Step 1: Click the "Start Recording" button below.</li>
+                <li>Step 2: Start typing directly into the text box. Follow the highlighted text.</li>
+                <li>Step 3: Click "Stop Recording" when you have finished the paragraph.</li>
               </ol>
-            </div>
-
-            <div className="flex flex-wrap gap-3">
-              {[
-                { key: "paragraph", label: "Paragraph to Type" },
-                { key: "special", label: "Special Key Block" },
-              ].map((tab) => (
-                <button
-                  key={tab.key}
-                  type="button"
-                  onClick={() => setActiveTab(tab.key)}
-                  className={`rounded-full px-4 py-2 text-sm font-semibold transition ${
-                    activeTab === tab.key
-                      ? "bg-[var(--accent)] text-white"
-                      : "bg-slate-100 text-slate-700 hover:bg-slate-200"
-                  }`}
-                >
-                  {tab.label}
-                </button>
-              ))}
-            </div>
-
-            <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm leading-6 text-slate-800">
-              {activeTab === "paragraph" ? (
-                <pre className="whitespace-pre-wrap font-[var(--font-mono)] text-xs sm:text-sm">
-                  {paragraphText}
-                </pre>
-              ) : (
-                <p className="font-[var(--font-mono)] text-xs sm:text-sm">
-                  {specialKeyText}
-                </p>
-              )}
             </div>
           </div>
         </section>

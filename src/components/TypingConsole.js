@@ -2,6 +2,17 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 
+const TARGET_TEXT = `The quick brown fox jumps over the lazy dog while amazing zebras quietly vex jumpy kids, proving every letter is present.
+Pack my box with five dozen liquor jugs to verify the alphabet twice.
+Digits appear forward and backward: 1234567890 then 0987654321, followed by sequences like 2468, 13579, and 314159.
+Now we add punctuation: .
+, ; : ? ! ' " - _ ( ) [ ] { } /
+
+Symbols and operators: @ # $ % ^ & * + = < > | ~
+To include uppercase properly, acronyms like NASA, USA, UN, AI, ML, and HTML are written in full caps.
+Typing speed and accuracy will be measured across every key, ensuring consistency of captured events.
+Finally, we conclude with a mix: The year is 2025; version v1.0-beta includes features [alpha], {bravo}, and (charlie), all typed carefully for complete coverage of the QWERTY keyboard.`;
+
 function buildCsv(metadata, keystrokes) {
 	const metadataRows = Object.entries(metadata).map(([key, value]) =>
 		`${key},${String(value ?? "").replace(/\n/g, " ")}`
@@ -26,6 +37,7 @@ export default function TypingConsole({ sessionId, socket, metadata, deviceId })
 	const [typedText, setTypedText] = useState("");
 	const [micError, setMicError] = useState("");
 	const [lastUpload, setLastUpload] = useState("");
+
 	const isSocketReady = Boolean(socket && socket.connected);
 
 	const streamRef = useRef(null);
@@ -35,6 +47,7 @@ export default function TypingConsole({ sessionId, socket, metadata, deviceId })
 	const beepTimeRef = useRef(null);
 	const beepTimeoutRef = useRef(null);
 	const recordingRef = useRef(false);
+	const inputRef = useRef(null); // Reference for our hidden monkeytype input
 
 	useEffect(() => {
 		let cancelled = false;
@@ -118,6 +131,7 @@ export default function TypingConsole({ sessionId, socket, metadata, deviceId })
 		oscillator.connect(gain);
 		gain.connect(audioContext.destination);
 		oscillator.start();
+
 		beepTimeRef.current = performance.now();
 
 		setTimeout(() => {
@@ -148,6 +162,8 @@ export default function TypingConsole({ sessionId, socket, metadata, deviceId })
 		}
 		beepTimeoutRef.current = setTimeout(() => {
 			playBeep();
+			// Auto-focus the hidden input so the user can type immediately
+			inputRef.current?.focus();
 		}, 1000);
 	};
 
@@ -228,8 +244,7 @@ export default function TypingConsole({ sessionId, socket, metadata, deviceId })
 				<div>
 					<h2 className="text-lg font-semibold text-slate-900">TYPING BOX</h2>
 					<p className="mt-1 text-sm text-slate-600">
-						Click inside and start typing after you hear a beep after you have
-						clicked "Start Recording".
+						Click inside the text box below and start typing after you hear the beep.
 					</p>
 				</div>
 
@@ -249,7 +264,7 @@ export default function TypingConsole({ sessionId, socket, metadata, deviceId })
 						type="button"
 						onClick={() => stopRecording(false)}
 						disabled={!sessionId || !isSocketReady}
-						className="rounded-full border border-slate-200 bg-white px-5 py-2 text-sm font-semibold text-slate-700 transition hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-50"
+						className="rounded-full bg-rose-600 px-5 py-2 text-sm font-semibold text-white transition hover:-translate-y-0.5 hover:bg-rose-700 disabled:cursor-not-allowed disabled:opacity-50"
 					>
 						Stop Recording
 					</button>
@@ -283,15 +298,67 @@ export default function TypingConsole({ sessionId, socket, metadata, deviceId })
 					{lastUpload ? <span className="text-emerald-700">{lastUpload}</span> : null}
 				</div>
 
-				<textarea
-					rows={8}
-					value={typedText}
-					onChange={(event) => setTypedText(event.target.value)}
-					onKeyDown={(event) => handleKeyEvent(event, "down")}
-					onKeyUp={(event) => handleKeyEvent(event, "up")}
-					className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-4 text-sm text-slate-800"
-					placeholder="Start typing here..."
-				/>
+				{/* MONKEYTYPE INTERFACE */}
+				<div 
+					className="relative w-full rounded-2xl border border-slate-200 bg-slate-50 px-5 py-6 text-lg sm:text-xl font-mono cursor-text"
+					onClick={() => inputRef.current?.focus()}
+				>
+					{/* Hidden input field for native typing support and paste blocking */}
+					<textarea
+						ref={inputRef}
+						value={typedText}
+						onChange={(event) => setTypedText(event.target.value)}
+						onKeyDown={(event) => handleKeyEvent(event, "down")}
+						onKeyUp={(event) => handleKeyEvent(event, "up")}
+						onPaste={(event) => event.preventDefault()}
+						onDrop={(event) => event.preventDefault()}
+						className="absolute top-0 left-0 w-[1px] h-[1px] opacity-0 -z-10"
+						autoComplete="off"
+						autoCorrect="off"
+						autoCapitalize="off"
+						spellCheck="false"
+					/>
+					
+					{/* Visual Text Rendering */}
+					<div className="whitespace-pre-wrap leading-relaxed select-none pointer-events-none">
+						{TARGET_TEXT.split('').map((char, index) => {
+							let charClass = "text-slate-500"; // default untyped color
+							
+							if (index < typedText.length) {
+								if (typedText[index] === char) {
+									charClass = "text-slate-800 font-medium"; // correctly typed
+								} else {
+									charClass = "text-rose-600 bg-rose-200/50 rounded-[2px]"; // incorrectly typed
+								}
+							}
+
+							const isCursor = index === typedText.length && status === "recording";
+
+							return (
+								<span key={index} className={`relative ${charClass}`}>
+									{isCursor && (
+										<span className="absolute left-0 top-[10%] h-[80%] w-[2px] bg-[var(--accent)] animate-pulse" />
+									)}
+									{char}
+								</span>
+							);
+						})}
+						
+						{/* Render extra characters typed beyond the target text in red */}
+						{typedText.slice(TARGET_TEXT.length).split('').map((char, index) => (
+							<span key={`extra-${index}`} className="text-rose-600 bg-rose-200/50 rounded-[2px]">
+								{char}
+							</span>
+						))}
+						
+						{/* Cursor placement if user is exactly at or past the end of the text */}
+						{typedText.length >= TARGET_TEXT.length && status === "recording" && (
+							<span className="relative">
+								<span className="absolute left-0 top-[10%] h-[80%] w-[2px] bg-[var(--accent)] animate-pulse" />
+							</span>
+						)}
+					</div>
+				</div>
 
 				<p className="text-xs uppercase tracking-[0.2em] text-slate-400">
 					For Research Purposes Only. Thank You For Your Participation.
