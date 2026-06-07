@@ -31,9 +31,18 @@ def bandpass_filter(data, rate, low=2500, high=3500):
 	return signal.filtfilt(b, a, data)
 
 
-def find_offset(laptop_data, mobile_data):
-	correlation = signal.correlate(laptop_data, mobile_data, mode="full")
-	lag = int(np.argmax(correlation) - (len(mobile_data) - 1))
+def find_offset(laptop_data, mobile_data, sample_rate=48000):
+	# We only need the first 30 seconds of audio to find the sync beep.
+	# This prevents massive OOM (Out of Memory) crashes on long recordings.
+	max_samples = sample_rate * 30
+	lap_crop = laptop_data[:max_samples]
+	mob_crop = mobile_data[:max_samples]
+
+	# Explicitly use method="fft" for maximum speed on the cropped arrays
+	correlation = signal.correlate(lap_crop, mob_crop, mode="full", method="fft")
+	
+	# The mathematical lag is identical whether we correlate the cropped or full arrays
+	lag = int(np.argmax(correlation) - (len(mob_crop) - 1))
 	return lag
 
 
