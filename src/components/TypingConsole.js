@@ -116,57 +116,65 @@ export default function TypingConsole({ sessionId, socket, metadata, deviceId })
 		return "Microphone idle";
 	}, [status]);
 
-	const playBeep = () => {
-		const AudioContext = window.AudioContext || window.webkitAudioContext;
-		if (!AudioContext) return;
+	const playBeep = (audioContext) => {
+        if (!audioContext) return;
 
-		const audioContext = new AudioContext();
-		const oscillator = audioContext.createOscillator();
-		const gain = audioContext.createGain();
+        const oscillator = audioContext.createOscillator();
+        const gain = audioContext.createGain();
 
-		oscillator.type = "sine";
-		oscillator.frequency.setValueAtTime(3000, audioContext.currentTime);
-		gain.gain.setValueAtTime(0.15, audioContext.currentTime);
+        oscillator.type = "sine";
+        oscillator.frequency.setValueAtTime(3000, audioContext.currentTime);
+        gain.gain.setValueAtTime(0.4, audioContext.currentTime);
 
-		oscillator.connect(gain);
-		gain.connect(audioContext.destination);
-		oscillator.start();
+        oscillator.connect(gain);
+        gain.connect(audioContext.destination);
+        oscillator.start();
 
-		beepTimeRef.current = performance.now();
+        beepTimeRef.current = performance.now();
 
-		setTimeout(() => {
-			oscillator.stop();
-			audioContext.close();
-		}, 50);
-	};
+        setTimeout(() => {
+            oscillator.stop();
+            // We no longer close the context here, we just stop the oscillator
+        }, 200); // Increased from 50ms to 200ms
+    };
 
 	const startRecording = () => {
-		if (!sessionId) return;
-		if (recordingRef.current) return;
-		if (mediaRecorderRef.current?.state === "recording") return;
-		if (!mediaRecorderRef.current) {
-			setMicError("Microphone is not ready yet.");
-			return;
-		}
+        if (!sessionId) return;
+        if (recordingRef.current) return;
+        if (mediaRecorderRef.current?.state === "recording") return;
+        if (!mediaRecorderRef.current) {
+            setMicError("Microphone is not ready yet.");
+            return;
+        }
 
-		chunksRef.current = [];
-		keystrokesRef.current = [];
-		beepTimeRef.current = null;
-		mediaRecorderRef.current.start(1000);
-		setStatus("recording");
-		recordingRef.current = true;
-		setLastUpload("");
+        // Instantly create/resume the AudioContext on the trusted user click
+        const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+        const clickContext = AudioContextClass ? new AudioContextClass() : null;
+        if (clickContext && clickContext.state === 'suspended') {
+            clickContext.resume();
+        }
 
-		if (beepTimeoutRef.current) {
-			clearTimeout(beepTimeoutRef.current);
-		}
-		beepTimeoutRef.current = setTimeout(() => {
-			playBeep();
-			// Auto-focus the hidden input so the user can type immediately
-			inputRef.current?.focus();
-		}, 1000);
-	};
+        chunksRef.current = [];
+        keystrokesRef.current = [];
+        beepTimeRef.current = null;
+        mediaRecorderRef.current.start(1000);
+        setStatus("recording");
+        recordingRef.current = true;
+        setLastUpload("");
 
+        if (beepTimeoutRef.current) {
+            clearTimeout(beepTimeoutRef.current);
+        }
+        
+        beepTimeoutRef.current = setTimeout(() => {
+            // Pass the pre-authorized context into the beep function
+            if (clickContext) {
+                playBeep(clickContext);
+            }
+            // Auto-focus the hidden input so the user can type immediately
+            inputRef.current?.focus();
+        }, 1000);
+    };
 	const stopRecording = async (remoteStop = false) => {
 		if (status !== "recording") return;
 		recordingRef.current = false;
@@ -246,6 +254,9 @@ export default function TypingConsole({ sessionId, socket, metadata, deviceId })
 					<p className="mt-1 text-sm text-slate-600">
 						Click inside the text box below and start typing after you hear the beep.
 					</p>
+					<p className="mt-1 text-sm font-medium text-rose-600">
+            			Note: If you skip a letter or add an extra space, the text will fall out of sync and turn red! Use Backspace to correct mistakes.
+        			</p>
 				</div>
 
 				<div className="flex flex-wrap gap-3">
