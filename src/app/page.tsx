@@ -66,6 +66,7 @@ const emptyParticipant = {
   room_type: "",
   voip_type: "",
   noise_cancellation: "",
+  microphone_mode: "",
 };
 
 export default function Home() {
@@ -503,6 +504,23 @@ export default function Home() {
               >
                 <option value="">Select</option>
                 {["On", "Off"].map((item) => (
+                  <option key={item} value={item}>
+                    {item}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="flex flex-col gap-2 text-xs font-medium uppercase tracking-wide text-slate-500">
+              Microphone Mode
+              <select
+                value={participant.microphone_mode}
+                onChange={(event) =>
+                  handleParticipantChange("microphone_mode", event.target.value)
+                }
+                className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"
+              >
+                <option value="">Select</option>
+                {["External Microphone", "Internal Microphone"].map((item) => (
                   <option key={item} value={item}>
                     {item}
                   </option>
